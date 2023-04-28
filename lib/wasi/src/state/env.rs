@@ -6,8 +6,8 @@ use tracing::{trace, warn};
 use virtual_fs::{FsError, VirtualFile};
 use virtual_net::DynVirtualNetworking;
 use wasmer::{
-    AsStoreMut, AsStoreRef, FunctionEnvMut, Global, Instance, Memory, MemoryView, Module,
-    TypedFunction,
+    AsStoreMut, AsStoreRef, FunctionEnvMut, Global, Instance, Memory, MemoryError, MemoryView,
+    Module, TypedFunction,
 };
 use wasmer_wasix_types::{
     types::Signal,
@@ -466,7 +466,7 @@ impl WasiEnv {
                 tracing::error!("wasi[{}]::wasm instantiate error ({})", pid, err);
                 func_env
                     .data(&store)
-                    .blocking_cleanup(Some(Errno::Noexec.into()));
+                    .blocking_cleanup(&store, Some(Errno::Noexec.into()));
                 return Err(err.into());
             }
         };
@@ -481,7 +481,7 @@ impl WasiEnv {
             tracing::error!("wasi[{}]::wasi initialize error ({})", pid, err);
             func_env
                 .data(&store)
-                .blocking_cleanup(Some(Errno::Noexec.into()));
+                .blocking_cleanup(&store, Some(Errno::Noexec.into()));
             return Err(err.into());
         }
 
@@ -491,7 +491,7 @@ impl WasiEnv {
                 if let Err(err) = crate::run_wasi_func_start(initialize, &mut store) {
                     func_env
                         .data(&store)
-                        .blocking_cleanup(Some(Errno::Noexec.into()));
+                        .blocking_cleanup(&store, Some(Errno::Noexec.into()));
                     return Err(err);
                 }
             }
@@ -904,9 +904,9 @@ impl WasiEnv {
 
     /// Cleans up all the open files (if this is the main thread)
     #[allow(clippy::await_holding_lock)]
-    pub fn blocking_cleanup(&self, exit_code: Option<ExitCode>) {
+    pub fn blocking_cleanup(&self, store: &impl AsStoreRef, exit_code: Option<ExitCode>) {
         __asyncify_light(self, None, async {
-            self.cleanup(exit_code).await;
+            self.cleanup(store, exit_code).await;
             Ok(())
         })
         .ok();
@@ -914,7 +914,7 @@ impl WasiEnv {
 
     /// Cleans up all the open files (if this is the main thread)
     #[allow(clippy::await_holding_lock)]
-    pub async fn cleanup(&self, exit_code: Option<ExitCode>) {
+    pub async fn cleanup(&self, store: &impl AsStoreRef, exit_code: Option<ExitCode>) {
         const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
         // If this is the main thread then also close all the files
@@ -938,6 +938,24 @@ impl WasiEnv {
             // Terminate the process
             let exit_code = exit_code.unwrap_or_else(|| Errno::Canceled.into());
             self.process.terminate(exit_code);
+
+            // Now we also force all the memory into a protected state which will prevent any reads
+            // or writes and thus terminate processes that try to use it
+            match self.memory().make_inaccessible(store) {
+                Ok(_) => {}
+                Err(MemoryError::NotImplemented) => {
+                    // we silently ignore memory that does not implement this yet rather
+                    // than failing the cleanup call. the consequences for the runtime
+                    // are that for these types of memories they are still accessible after
+                    // the process is terminated.
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "WasiEnv::cleanup failed to set memory to inaccessible - {}",
+                        err
+                    );
+                }
+            }
         }
     }
 }

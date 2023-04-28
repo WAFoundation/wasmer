@@ -140,6 +140,13 @@ impl WasmMmap {
             size: self.size,
         })
     }
+
+    /// Makes all the memory inaccessible to reads and writes
+    pub fn make_inaccessible(&self) -> Result<(), MemoryError> {
+        self.alloc
+            .make_all_inaccessible()
+            .map_err(MemoryError::Region)
+    }
 }
 
 /// A linear memory instance.
@@ -299,6 +306,11 @@ impl VMOwnedMemory {
             config: self.config.clone(),
         })
     }
+
+    /// Makes all the memory inaccessible to reads and writes
+    pub fn make_inaccessible(&self) -> Result<(), MemoryError> {
+        self.mmap.make_inaccessible()
+    }
 }
 
 impl LinearMemory for VMOwnedMemory {
@@ -340,6 +352,11 @@ impl LinearMemory for VMOwnedMemory {
     fn duplicate(&mut self) -> Result<Box<dyn LinearMemory + 'static>, MemoryError> {
         let forked = Self::duplicate(self)?;
         Ok(Box::new(forked))
+    }
+
+    /// Makes all the memory inaccessible to reads and writes
+    fn make_inaccessible(&self) -> Result<(), MemoryError> {
+        Self::make_inaccessible(self)
     }
 }
 
@@ -389,6 +406,12 @@ impl VMSharedMemory {
             config: self.config.clone(),
             conditions: ThreadConditions::new(),
         })
+    }
+
+    /// Makes all the memory inaccessible to reads and writes
+    pub fn make_inaccessible(&self) -> Result<(), MemoryError> {
+        let guard = self.mmap.write().unwrap();
+        guard.make_inaccessible()
     }
 }
 
@@ -451,6 +474,11 @@ impl LinearMemory for VMSharedMemory {
     /// Notify waiters from the wait list. Return the number of waiters notified
     fn do_notify(&mut self, dst: NotifyLocation, count: u32) -> u32 {
         self.conditions.do_notify(dst, count)
+    }
+
+    /// Makes all the memory inaccessible to reads and writes
+    fn make_inaccessible(&self) -> Result<(), MemoryError> {
+        Self::make_inaccessible(self)
     }
 }
 
@@ -533,6 +561,11 @@ impl LinearMemory for VMMemory {
     fn do_notify(&mut self, dst: NotifyLocation, count: u32) -> u32 {
         self.0.do_notify(dst, count)
     }
+
+    /// Makes all the memory inaccessible to reads and writes
+    fn make_inaccessible(&self) -> Result<(), MemoryError> {
+        self.0.make_inaccessible()
+    }
 }
 
 impl VMMemory {
@@ -595,6 +628,11 @@ impl VMMemory {
     /// Copies this memory to a new memory
     pub fn duplicate(&mut self) -> Result<Box<dyn LinearMemory + 'static>, MemoryError> {
         LinearMemory::duplicate(self)
+    }
+
+    /// Makes all the memory inaccessible to reads and writes
+    pub fn make_inaccessible(&self) -> Result<(), MemoryError> {
+        LinearMemory::make_inaccessible(self)
     }
 }
 
@@ -665,5 +703,10 @@ where
     /// Notify waiters from the wait list. Return the number of waiters notified
     fn do_notify(&mut self, _dst: NotifyLocation, _count: u32) -> u32 {
         0
+    }
+
+    /// Makes all the memory inaccessible to reads and writes
+    fn make_inaccessible(&self) -> Result<(), MemoryError> {
+        Err(MemoryError::NotImplemented)
     }
 }
