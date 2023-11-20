@@ -42,20 +42,13 @@ mod macros;
 pub mod bin_factory;
 pub mod os;
 // TODO: should this be pub?
-pub mod net;
-// TODO: should this be pub?
-pub mod capabilities;
 pub mod fs;
-pub mod http;
+pub mod net;
 mod rewind;
 pub mod runners;
-pub mod runtime;
 mod state;
 mod syscalls;
 mod utils;
-
-/// WAI based bindings.
-mod bindings;
 
 #[allow(unused_imports)]
 use bytes::{Bytes, BytesMut};
@@ -85,16 +78,13 @@ use wasmer_wasix_types::wasi::{Errno, ExitCode};
 
 pub use crate::{
     fs::{default_fs_backing, Fd, WasiFs, WasiInodes, VIRTUAL_ROOT_FD},
-    os::{
-        task::{
-            control_plane::WasiControlPlane,
-            process::{WasiProcess, WasiProcessId},
-            thread::{WasiThread, WasiThreadError, WasiThreadHandle, WasiThreadId},
-        },
-        WasiTtyState,
+    os::task::{
+        control_plane::WasiControlPlane,
+        process::{WasiProcess, WasiProcessId},
+        thread::{WasiThread, WasiThreadError, WasiThreadHandle, WasiThreadId},
     },
     rewind::*,
-    runtime::{task_manager::VirtualTaskManager, PluggableRuntime, Runtime},
+    runtime::{task_manager::VirtualTaskManager, PluggableRuntime, Runtime, TtyState},
     state::{
         WasiEnv, WasiEnvBuilder, WasiEnvInit, WasiFunctionEnv, WasiInstanceHandles,
         WasiStateCreationError, ALL_RIGHTS,

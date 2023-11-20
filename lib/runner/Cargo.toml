@@ -1,0 +1,54 @@
+[package]
+name = "wasmer-runner"
+version = "0.1.0"
+description = "Wasmer Runner allows plugging in different implementations."
+categories = ["wasm", "os"]
+keywords = ["wasm", "webassembly", "wasi", "sandbox", "ABI"]
+readme = "README.md"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cfg-if = "1.0"
+thiserror = "1"
+tracing = { version = "0.1.37" }
+wasmer-wasix-types = { path = "../wasi-types", version = "0.16.0", features = [ "enable-serde" ] }
+wasmer-types = { path = "../types", version = "=4.2.3", default-features = false }
+wasmer = { path = "../api", version = "=4.2.3", default-features = true }
+webc.workspace = true
+virtual-mio  = { path = "../virtual-io", version = "0.3.0", default-features = false }
+virtual-fs = { path = "../virtual-fs", version = "0.9.0", default-features = false, features = ["webc-fs"] }
+virtual-net = { path = "../virtual-net", version = "0.6.1", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+bincode = { version = "1.3" }
+derivative = { version = "^2" }
+bytes = "1"
+serde_cbor = { version = "0.11.2" }
+anyhow = { version = "1.0.66" }
+sha2 = { version = "0.10" }
+tokio = { version = "1", features = ["sync", "macros", "time", "rt", "rt-multi-thread"], default_features = false }
+futures = { version = "0.3" }
+async-trait = { version = "^0.1" }
+serde_json = { version = "^1" }
+weezl = { version = "^0.1" }
+hex = { version = "^0.4" }
+term_size = { version = "0.3" }
+http = "0.2.8"
+wai-bindgen-wasmer = { path = "../wai-bindgen-wasmer", version = "0.16.0", features = ["tracing"] }
+once_cell = "1.17.0"
+semver = "1.0.17"
+dashmap = "5.4.0"
+tempfile = "3.6.0"
+url = "2.3.1"
+petgraph = "0.6.3"
+wasm-bindgen = { version = "0.2.87", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "^0.2", default-features = false }
+
+[target.'cfg(all(unix, not(target_os="ios")))'.dependencies]
+termios = { version = "0.3" }
