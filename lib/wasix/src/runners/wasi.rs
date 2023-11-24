@@ -32,6 +32,12 @@ impl WasiRunner {
         WasiRunner::default()
     }
 
+    /// Builder method to provide a filesystem to the runner
+    pub fn with_fs(mut self, fs: TmpFileSystem) -> Self {
+        self.wasi.fs = Some(fs);
+        self
+    }
+
     /// Returns the current arguments for this `WasiRunner`
     pub fn get_args(&self) -> Vec<String> {
         self.wasi.args.clone()
@@ -64,7 +70,7 @@ impl WasiRunner {
 
     /// Provide environment variables to the runner.
     pub fn set_env(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.wasi.env.insert(key.into(), value.into());
+        self.wasi.env.push((key.into(), value.into()));
     }
 
     pub fn with_envs<I, K, V>(mut self, envs: I) -> Self
@@ -84,7 +90,7 @@ impl WasiRunner {
         V: Into<String>,
     {
         for (key, value) in envs {
-            self.wasi.env.insert(key.into(), value.into());
+            self.wasi.env.push((key.into(), value.into()));
         }
     }
 
@@ -112,6 +118,7 @@ impl WasiRunner {
         self.wasi.current_dir = Some(dir.into());
     }
 
+    /// Builder method to provide the current Dir
     pub fn with_current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.set_current_dir(dir);
         self
@@ -220,24 +227,14 @@ impl WasiRunner {
 
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn prepare_webc_env(
-        &self,
+        &mut self,
         program_name: &str,
         wasi: &Wasi,
         pkg: Option<&BinaryPackage>,
         runtime: Arc<dyn Runtime + Send + Sync>,
-        root_fs: Option<TmpFileSystem>,
     ) -> Result<WasiEnvBuilder, anyhow::Error> {
-        let mut builder = WasiEnvBuilder::new(program_name).runtime(runtime);
-
-        let container_fs = if let Some(pkg) = pkg {
-            builder.add_webc(pkg.clone());
-            Some(Arc::clone(&pkg.webc_fs))
-        } else {
-            None
-        };
-
-        self.wasi
-            .prepare_webc_env(&mut builder, container_fs, wasi, root_fs)?;
+        let mut builder = WasiEnvBuilder::new(program_name);
+        self.wasi.prepare_webc_env(&mut builder, wasi, pkg)?;
 
         if let Some(stdin) = &self.stdin {
             builder.set_stdin(Box::new(stdin.clone()));
@@ -248,20 +245,30 @@ impl WasiRunner {
         if let Some(stderr) = &self.stderr {
             builder.set_stderr(Box::new(stderr.clone()));
         }
+        if let Some(current_dir) = &self.wasi.current_dir {
+            builder.set_current_dir(current_dir);
+        }
+
+        builder.set_runtime(runtime);
+
+        if let Some(root_fs) = self.wasi.fs.take() {
+            self.wasi.set_filesystem(&mut builder, root_fs)?;
+        }
 
         Ok(builder)
     }
 
     pub fn run_wasm(
-        &self,
+        &mut self,
         runtime: Arc<dyn Runtime + Send + Sync>,
         program_name: &str,
         module: &Module,
+        pkg: Option<&BinaryPackage>,
         asyncify: bool,
     ) -> Result<(), Error> {
         let wasi = webc::metadata::annotations::Wasi::new(program_name);
         let mut store = runtime.new_store();
-        let env = self.prepare_webc_env(program_name, &wasi, None, runtime, None)?;
+        let env = self.prepare_webc_env(program_name, &wasi, pkg, runtime)?;
 
         if asyncify {
             env.run_with_store_async(module.clone(), store)?;
@@ -296,7 +303,7 @@ impl crate::runners::Runner for WasiRunner {
             .unwrap_or_else(|| Wasi::new(command_name));
 
         let env = self
-            .prepare_webc_env(command_name, &wasi, Some(pkg), Arc::clone(&runtime), None)
+            .prepare_webc_env(command_name, &wasi, Some(pkg), Arc::clone(&runtime))
             .context("Unable to prepare the WASI environment")?
             .build()?;
 

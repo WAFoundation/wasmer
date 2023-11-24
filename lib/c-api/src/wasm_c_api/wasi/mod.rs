@@ -19,7 +19,7 @@ use std::sync::Arc;
 #[cfg(feature = "webc_runner")]
 use wasmer_api::{AsStoreMut, Imports, Module};
 use wasmer_wasix::{
-    default_fs_backing, get_wasi_version,
+    get_wasi_version,
     runtime::task_manager::{tokio::TokioTaskManager, InlineWaker},
     virtual_fs::AsyncReadExt,
     virtual_fs::VirtualFile,
@@ -55,7 +55,7 @@ pub unsafe extern "C" fn wasi_config_new(
         inherit_stdout: true,
         inherit_stderr: true,
         inherit_stdin: true,
-        builder: WasiEnv::builder(prog_name).fs(default_fs_backing()),
+        builder: WasiEnv::builder(prog_name),
         runtime: Some(runtime),
     }))
 }
@@ -259,7 +259,7 @@ fn prepare_webc_env(
     len: usize,
     package_name: &str,
 ) -> Option<(WasiFunctionEnv, Imports)> {
-    use virtual_fs::static_fs::StaticFileSystem;
+    use virtual_fs::static_fs::WebCStaticFileSystem;
     use webc::v1::{FsEntryType, WebC};
 
     let store_mut = store.as_store_mut();
@@ -294,7 +294,7 @@ fn prepare_webc_env(
         })
         .collect::<Vec<_>>();
 
-    let filesystem = Box::new(StaticFileSystem::init(slice, package_name)?);
+    let filesystem = Box::new(WebCStaticFileSystem::init(slice, package_name)?);
     let mut builder = config.builder.runtime(Arc::new(rt));
 
     if !config.inherit_stdout {

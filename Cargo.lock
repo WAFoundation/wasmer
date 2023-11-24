@@ -5095,6 +5095,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-test",
  "typetag",
  "webc",
 ]
@@ -5707,6 +5708,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shared-buffer",
  "spinoff",
  "tar",
  "target-lexicon 0.12.12",
@@ -6585,9 +6587,9 @@ dependencies = [
 
 [[package]]
 name = "webc"
-version = "5.8.0"
+version = "5.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac815d472f09ed064ef70a3046843972646727cbe55db795dd8a9925b76ed0c4"
+checksum = "973ca5a91b4fb3e4bb37cfebe03ef9364d0aff2765256abefdb7e79dc9188483"
 dependencies = [
  "anyhow",
  "base64",

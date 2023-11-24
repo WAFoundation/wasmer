@@ -10,8 +10,8 @@ use std::{
 
 use futures::future::BoxFuture;
 use virtual_fs::{
-    host_fs, mem_fs, passthru_fs, tmp_fs, union_fs, AsyncRead, AsyncSeek, AsyncWrite,
-    AsyncWriteExt, FileSystem, Pipe, ReadBuf, RootFileSystemBuilder,
+    host_fs, mem_fs, tmp_fs, AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt, FileSystem, Pipe,
+    ReadBuf, RootFileSystemBuilder,
 };
 use wasmer::{FunctionEnv, Imports, Module, Store};
 use wasmer_wasix::runtime::task_manager::{tokio::TokioTaskManager, InlineWaker};
@@ -33,12 +33,6 @@ pub enum WasiFileSystemKind {
 
     /// Instruct the test runner to use `virtual_fs::tmp_fs`
     Tmp,
-
-    /// Instruct the test runner to use `virtual_fs::passtru_fs`
-    PassthruMemory,
-
-    /// Instruct the test runner to use `virtual_fs::union_fs<host_fs, mem_fs>`
-    UnionHostMemory,
 
     /// Instruct the test runner to use the TempFs returned by `virtual_fs::builder::RootFileSystemBuilder`
     RootFileSystemBuilder,
@@ -121,7 +115,7 @@ impl<'a> WasiTest<'a> {
         };
 
         let module = Module::new(store, wasm_bytes)?;
-        let (builder, _tempdirs, mut stdin_tx, stdout_rx, stderr_rx) =
+        let (builder, mut stdin_tx, stdout_rx, stderr_rx) =
             { InlineWaker::block_on(async { self.create_wasi_env(filesystem_kind).await }) }?;
 
         let (instance, _wasi_env) = builder.runtime(Arc::new(rt)).instantiate(module, store)?;
@@ -179,7 +173,6 @@ impl<'a> WasiTest<'a> {
         filesystem_kind: WasiFileSystemKind,
     ) -> anyhow::Result<(
         WasiEnvBuilder,
-        Vec<tempfile::TempDir>,
         Pipe,
         mpsc::Receiver<Vec<u8>>,
         mpsc::Receiver<Vec<u8>>,
@@ -193,63 +186,41 @@ impl<'a> WasiTest<'a> {
             builder.add_env(name, value);
         }
 
-        let mut host_temp_dirs_to_not_drop = vec![];
-
         match filesystem_kind {
             WasiFileSystemKind::Host => {
-                let fs = host_fs::FileSystem::default();
+                let root_fs = RootFileSystemBuilder::new().build();
+
+                let base_dir = PathBuf::from(BASE_TEST_DIR);
 
                 for (alias, real_dir) in &self.mapped_dirs {
-                    let mut dir = PathBuf::from(BASE_TEST_DIR);
-                    dir.push(real_dir);
-                    builder.add_map_dir(alias, dir)?;
+                    let fs: Arc<(dyn virtual_fs::FileSystem + std::marker::Send + Sync + 'static)> =
+                        Arc::new(host_fs::FileSystem::new(base_dir.join(real_dir))?);
+                    root_fs.mount(alias.into(), &fs, PathBuf::new())?;
                 }
 
                 // due to the structure of our code, all preopen dirs must be mapped now
                 for dir in &self.dirs {
-                    let mut new_dir = PathBuf::from(BASE_TEST_DIR);
-                    new_dir.push(dir);
-                    builder.add_map_dir(dir, new_dir)?;
+                    let fs: Arc<(dyn virtual_fs::FileSystem + std::marker::Send + Sync + 'static)> =
+                        Arc::new(host_fs::FileSystem::new(base_dir.join(dir))?);
+                    root_fs.mount(dir.into(), &fs, PathBuf::new())?;
                 }
 
                 for alias in &self.temp_dirs {
                     let temp_dir = tempfile::tempdir()?;
-                    builder.add_map_dir(alias, temp_dir.path())?;
-                    host_temp_dirs_to_not_drop.push(temp_dir);
+                    let fs: Arc<(dyn virtual_fs::FileSystem + std::marker::Send + Sync + 'static)> =
+                        Arc::new(host_fs::FileSystem::new(temp_dir.path().to_owned())?);
+                    root_fs.mount(alias.into(), &fs, PathBuf::new())?;
                 }
 
-                builder.set_fs(Box::new(fs));
+                builder.set_fs(Box::new(root_fs));
             }
 
             other => {
                 let fs: Box<dyn FileSystem + Send + Sync> = match other {
                     WasiFileSystemKind::InMemory => Box::<mem_fs::FileSystem>::default(),
                     WasiFileSystemKind::Tmp => Box::<tmp_fs::TmpFileSystem>::default(),
-                    WasiFileSystemKind::PassthruMemory => {
-                        let fs = Box::<mem_fs::FileSystem>::default();
-                        Box::new(passthru_fs::PassthruFileSystem::new(fs))
-                    }
                     WasiFileSystemKind::RootFileSystemBuilder => {
                         Box::new(RootFileSystemBuilder::new().build())
-                    }
-                    WasiFileSystemKind::UnionHostMemory => {
-                        let a = mem_fs::FileSystem::default();
-                        let b = mem_fs::FileSystem::default();
-                        let c = mem_fs::FileSystem::default();
-                        let d = mem_fs::FileSystem::default();
-                        let e = mem_fs::FileSystem::default();
-                        let f = mem_fs::FileSystem::default();
-
-                        let mut union = union_fs::UnionFileSystem::new();
-
-                        union.mount("mem_fs", "/test_fs", false, Box::new(a), None);
-                        union.mount("mem_fs_2", "/snapshot1", false, Box::new(b), None);
-                        union.mount("mem_fs_3", "/tests", false, Box::new(c), None);
-                        union.mount("mem_fs_4", "/nightly_2022_10_18", false, Box::new(d), None);
-                        union.mount("mem_fs_5", "/unstable", false, Box::new(e), None);
-                        union.mount("mem_fs_6", "/.tmp_wasmer_wast_0", false, Box::new(f), None);
-
-                        Box::new(union)
                     }
                     _ => {
                         panic!("unexpected filesystem type {:?}", other);
@@ -296,13 +267,7 @@ impl<'a> WasiTest<'a> {
             .stdout(Box::new(stdout))
             .stderr(Box::new(stderr));
 
-        Ok((
-            builder,
-            host_temp_dirs_to_not_drop,
-            stdin_tx,
-            stdout_rx,
-            stderr_rx,
-        ))
+        Ok((builder, stdin_tx, stdout_rx, stderr_rx))
     }
 
     /// Get the correct [`WasiVersion`] from the Wasm [`Module`].

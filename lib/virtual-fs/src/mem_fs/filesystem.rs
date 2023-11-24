@@ -1,11 +1,9 @@
 //! This module contains the [`FileSystem`] type itself.
 
 use super::*;
-use crate::{DirEntry, FileSystem as _, FileType, FsError, Metadata, OpenOptions, ReadDir, Result};
+use crate::{DirEntry, FileType, FsError, Metadata, OpenOptions, ReadDir, Result};
 use futures::future::BoxFuture;
 use slab::Slab;
-use std::collections::VecDeque;
-use std::convert::identity;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -15,7 +13,7 @@ use std::sync::{Arc, RwLock};
 ///
 /// This `FileSystem` type can be cloned, it's a light copy of the
 /// `FileSystemInner` (which is behind a `Arc` + `RwLock`).
-#[derive(Clone, Default)]
+#[derive(Default, Clone)]
 pub struct FileSystem {
     pub(super) inner: Arc<RwLock<FileSystemInner>>,
 }
@@ -33,133 +31,6 @@ impl FileSystem {
     pub fn canonicalize_unchecked(&self, path: &Path) -> Result<PathBuf> {
         let lock = self.inner.read().map_err(|_| FsError::Lock)?;
         lock.canonicalize_without_inode(path)
-    }
-
-    /// Merge all items from a given source path (directory) of a different file
-    /// system into this file system.
-    ///
-    /// Individual files and directories of the given path are mounted.
-    ///
-    /// This function is not recursive, only the items in the source_path are
-    /// mounted.
-    ///
-    /// See [`Self::union`] for mounting all inodes recursively.
-    pub fn mount_directory_entries(
-        &self,
-        target_path: &Path,
-        other: &Arc<dyn crate::FileSystem + Send + Sync>,
-        mut source_path: &Path,
-    ) -> Result<()> {
-        let fs_lock = self.inner.read().map_err(|_| FsError::Lock)?;
-
-        if cfg!(windows) {
-            // We need to take some care here because
-            // canonicalize_without_inode() doesn't accept Windows paths that
-            // start with a prefix (drive letters, UNC paths, etc.). If we
-            // somehow get one of those paths, we'll automatically trim it away.
-            let mut components = source_path.components();
-
-            if let Some(Component::Prefix(_)) = components.next() {
-                source_path = components.as_path();
-            }
-        }
-
-        let (_target_path, root_inode) = match fs_lock.canonicalize(target_path) {
-            Ok((p, InodeResolution::Found(inode))) => (p, inode),
-            Ok((_p, InodeResolution::Redirect(..))) => {
-                return Err(FsError::AlreadyExists);
-            }
-            Err(_) => {
-                // Root directory does not exist, so we can just mount.
-                return self.mount(target_path.to_path_buf(), other, source_path.to_path_buf());
-            }
-        };
-
-        let _root_node = match fs_lock.storage.get(root_inode).unwrap() {
-            Node::Directory(dir) => dir,
-            _ => {
-                return Err(FsError::AlreadyExists);
-            }
-        };
-
-        let source_path = fs_lock.canonicalize_without_inode(source_path)?;
-
-        std::mem::drop(fs_lock);
-
-        let source = other.read_dir(&source_path)?;
-        for entry in source.data {
-            let meta = entry.metadata?;
-
-            let entry_target_path = target_path.join(entry.path.file_name().unwrap());
-
-            if meta.is_file() {
-                self.insert_arc_file_at(entry_target_path, other.clone(), entry.path)?;
-            } else if meta.is_dir() {
-                self.insert_arc_directory_at(entry_target_path, other.clone(), entry.path)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn union(&self, other: &Arc<dyn crate::FileSystem + Send + Sync>) {
-        // Iterate all the directories and files in the other filesystem
-        // and create references back to them in this filesystem
-        let mut remaining = VecDeque::new();
-        remaining.push_back(PathBuf::from("/"));
-        while let Some(next) = remaining.pop_back() {
-            if next
-                .file_name()
-                .map(|n| n.to_string_lossy().starts_with(".wh."))
-                .unwrap_or(false)
-            {
-                let rm = next.to_string_lossy();
-                let rm = &rm[".wh.".len()..];
-                let rm = PathBuf::from(rm);
-                let _ = crate::FileSystem::remove_dir(self, rm.as_path());
-                let _ = crate::FileSystem::remove_file(self, rm.as_path());
-                continue;
-            }
-            let _ = crate::FileSystem::create_dir(self, next.as_path());
-
-            let dir = match other.read_dir(next.as_path()) {
-                Ok(dir) => dir,
-                Err(_) => {
-                    // TODO: propagate errors (except NotFound)
-                    continue;
-                }
-            };
-
-            for sub_dir_res in dir {
-                let sub_dir = match sub_dir_res {
-                    Ok(sub_dir) => sub_dir,
-                    Err(_) => {
-                        // TODO: propagate errors (except NotFound)
-                        continue;
-                    }
-                };
-
-                match sub_dir.file_type() {
-                    Ok(t) if t.is_dir() => {
-                        remaining.push_back(sub_dir.path());
-                    }
-                    Ok(t) if t.is_file() => {
-                        if sub_dir.file_name().to_string_lossy().starts_with(".wh.") {
-                            let rm = next.to_string_lossy();
-                            let rm = &rm[".wh.".len()..];
-                            let rm = PathBuf::from(rm);
-                            let _ = crate::FileSystem::remove_dir(self, rm.as_path());
-                            let _ = crate::FileSystem::remove_file(self, rm.as_path());
-                            continue;
-                        }
-                        let _ = self
-                            .new_open_options_ext()
-                            .insert_arc_file(sub_dir.path(), other.clone());
-                    }
-                    _ => {}
-                }
-            }
-        }
     }
 
     pub fn mount(
@@ -208,6 +79,7 @@ impl FileSystem {
             let inode_of_directory = fs.storage.vacant_entry().key();
             let real_inode_of_directory = fs.storage.insert(Node::ArcDirectory(ArcDirectoryNode {
                 inode: inode_of_directory,
+                parent_inode: inode_of_parent,
                 name: name_of_directory,
                 fs: other.clone(),
                 path: source_path,
@@ -215,10 +87,7 @@ impl FileSystem {
                     let time = time();
 
                     Metadata {
-                        ft: FileType {
-                            dir: true,
-                            ..Default::default()
-                        },
+                        ft: FileType::new_dir(),
                         accessed: time,
                         created: time,
                         modified: time,
@@ -241,44 +110,33 @@ impl FileSystem {
 }
 
 impl crate::FileSystem for FileSystem {
+    fn set_parent(&mut self, directory: Arc<dyn crate::Directory + Send + Sync>) -> Result<()> {
+        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
+        guard.parent = Some(directory);
+        Ok(())
+    }
+    fn parent(&self) -> Option<Arc<dyn crate::Directory + Send + Sync>> {
+        let guard = self.inner.write().ok()?;
+        guard.parent.clone()
+    }
+
+    fn as_dir(&self) -> Box<dyn crate::Directory + Send + Sync> {
+        Box::new(Directory::new(ROOT_INODE, self.clone()))
+    }
+
     fn read_dir(&self, path: &Path) -> Result<ReadDir> {
         // Read lock.
         let guard = self.inner.read().map_err(|_| FsError::Lock)?;
 
         // Canonicalize the path.
-        let (path, inode_of_directory) = guard.canonicalize(path)?;
+        let (_path, inode_of_directory) = guard.canonicalize(path)?;
         let inode_of_directory = match inode_of_directory {
             InodeResolution::Found(a) => a,
             InodeResolution::Redirect(fs, path) => {
                 return fs.read_dir(path.as_path());
             }
         };
-
-        // Check it's a directory and fetch the immediate children as `DirEntry`.
-        let inode = guard.storage.get(inode_of_directory);
-        let children = match inode {
-            Some(Node::Directory(DirectoryNode { children, .. })) => children
-                .iter()
-                .filter_map(|inode| guard.storage.get(*inode))
-                .map(|node| DirEntry {
-                    path: {
-                        let mut entry_path = path.to_path_buf();
-                        entry_path.push(node.name());
-
-                        entry_path
-                    },
-                    metadata: Ok(node.metadata().clone()),
-                })
-                .collect(),
-
-            Some(Node::ArcDirectory(ArcDirectoryNode { fs, path, .. })) => {
-                return fs.read_dir(path.as_path());
-            }
-
-            _ => return Err(FsError::InvalidInput),
-        };
-
-        Ok(ReadDir::new(children))
+        guard.read_dir_inode(inode_of_directory)
     }
 
     fn create_dir(&self, path: &Path) -> Result<()> {
@@ -315,107 +173,40 @@ impl crate::FileSystem for FileSystem {
 
             (inode_of_parent, name_of_directory)
         };
-
-        if self.read_dir(path).is_ok() {
-            return Err(FsError::AlreadyExists);
-        }
-
-        {
-            // Write lock.
-            let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
-
-            // Creating the directory in the storage.
-            let inode_of_directory = fs.storage.vacant_entry().key();
-            let real_inode_of_directory = fs.storage.insert(Node::Directory(DirectoryNode {
-                inode: inode_of_directory,
-                name: name_of_directory,
-                children: Vec::new(),
-                metadata: {
-                    let time = time();
-
-                    Metadata {
-                        ft: FileType {
-                            dir: true,
-                            ..Default::default()
-                        },
-                        accessed: time,
-                        created: time,
-                        modified: time,
-                        len: 0,
-                    }
-                },
-            }));
-
-            assert_eq!(
-                inode_of_directory, real_inode_of_directory,
-                "new directory inode should have been correctly calculated",
-            );
-
-            // Adding the new directory to its parent.
-            fs.add_child_to_node(inode_of_parent, inode_of_directory)?;
-        }
-
-        Ok(())
+        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
+        guard.create_dir_inode(inode_of_parent, name_of_directory)
     }
 
     fn remove_dir(&self, path: &Path) -> Result<()> {
-        let (inode_of_parent, position, inode_of_directory) = {
-            // Read lock.
-            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
 
-            // Canonicalize the path.
-            let (path, _) = guard.canonicalize(path)?;
+        // Canonicalize the path.
+        let (_path, node) = guard.canonicalize(path)?;
 
-            // Check the path has a parent.
-            let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
-
-            // Check the directory name.
-            let name_of_directory = path
-                .file_name()
-                .ok_or(FsError::InvalidInput)?
-                .to_os_string();
-
-            // Find the parent inode.
-            let inode_of_parent = match guard.inode_of_parent(parent_of_path)? {
-                InodeResolution::Found(a) => a,
-                InodeResolution::Redirect(fs, mut parent_path) => {
-                    drop(guard);
-                    parent_path.push(name_of_directory);
-                    return fs.remove_dir(parent_path.as_path());
-                }
-            };
-
-            // Get the child index to remove in the parent node, in
-            // addition to the inode of the directory to remove.
-            let (position, inode_of_directory) = guard
-                .as_parent_get_position_and_inode_of_directory(
-                    inode_of_parent,
-                    &name_of_directory,
-                    DirectoryMustBeEmpty::Yes,
-                )?;
-
-            (inode_of_parent, position, inode_of_directory)
-        };
-
-        let inode_of_directory = match inode_of_directory {
+        let inode_of_directory = match node {
             InodeResolution::Found(a) => a,
             InodeResolution::Redirect(fs, path) => {
                 return fs.remove_dir(path.as_path());
             }
         };
 
-        {
-            // Write lock.
-            let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+        guard.remove_dir_inode(inode_of_directory)
+    }
 
-            // Remove the directory from the storage.
-            fs.storage.remove(inode_of_directory);
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
 
-            // Remove the child from the parent directory.
-            fs.remove_child_from_node(inode_of_parent, position)?;
-        }
+        // Canonicalize the path.
+        let (_path, node) = guard.canonicalize(path)?;
 
-        Ok(())
+        let inode_of_file = match node {
+            InodeResolution::Found(a) => a,
+            InodeResolution::Redirect(fs, path) => {
+                return fs.remove_file(path.as_path());
+            }
+        };
+
+        guard.remove_file_inode(inode_of_file)
     }
 
     fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, Result<()>> {
@@ -512,6 +303,12 @@ impl crate::FileSystem for FileSystem {
                     // Add the file to its new parent, and update the modified
                     // time.
                     fs.add_child_to_node(inode_of_to_parent, inode)?;
+
+                    // Replace the inode parent
+                    let mut inode = fs.storage.get_mut(inode);
+                    if let Some(inode_mut) = inode.as_mut() {
+                        inode_mut.set_parent_inode(inode_of_to_parent);
+                    };
                 }
                 // Otherwise, we need to at least update the modified time of the parent.
                 else {
@@ -545,63 +342,6 @@ impl crate::FileSystem for FileSystem {
         }
     }
 
-    fn remove_file(&self, path: &Path) -> Result<()> {
-        let (inode_of_parent, position, inode_of_file) = {
-            // Read lock.
-            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
-
-            // Canonicalize the path.
-            let path = guard.canonicalize_without_inode(path)?;
-
-            // Check the path has a parent.
-            let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
-
-            // Check the file name.
-            let name_of_file = path
-                .file_name()
-                .ok_or(FsError::InvalidInput)?
-                .to_os_string();
-
-            // Find the parent inode.
-            let inode_of_parent = match guard.inode_of_parent(parent_of_path)? {
-                InodeResolution::Found(a) => a,
-                InodeResolution::Redirect(fs, mut parent_path) => {
-                    parent_path.push(name_of_file);
-                    return fs.remove_file(parent_path.as_path());
-                }
-            };
-
-            // Find the inode of the file if it exists, along with its position.
-            let maybe_position_and_inode_of_file =
-                guard.as_parent_get_position_and_inode_of_file(inode_of_parent, &name_of_file)?;
-
-            match maybe_position_and_inode_of_file {
-                Some((position, inode_of_file)) => (inode_of_parent, position, inode_of_file),
-                None => return Err(FsError::EntryNotFound),
-            }
-        };
-
-        let inode_of_file = match inode_of_file {
-            InodeResolution::Found(a) => a,
-            InodeResolution::Redirect(fs, path) => {
-                return fs.remove_file(path.as_path());
-            }
-        };
-
-        {
-            // Write lock.
-            let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
-
-            // Remove the file from the storage.
-            fs.storage.remove(inode_of_file);
-
-            // Remove the child from the parent directory.
-            fs.remove_child_from_node(inode_of_parent, position)?;
-        }
-
-        Ok(())
-    }
-
     fn new_open_options(&self) -> OpenOptions {
         OpenOptions::new(self)
     }
@@ -619,6 +359,7 @@ impl fmt::Debug for FileSystem {
 /// indexed by their respective `Inode` in a slab.
 pub(super) struct FileSystemInner {
     pub(super) storage: Slab<Node>,
+    pub(super) parent: Option<Arc<dyn crate::Directory + Send + Sync>>,
     pub(super) limiter: Option<crate::limiter::DynFsMemoryLimiter>,
 }
 
@@ -641,6 +382,143 @@ impl InodeResolution {
 }
 
 impl FileSystemInner {
+    pub(super) fn get_node(&self, inode: Inode) -> Option<&Node> {
+        self.storage.get(inode)
+    }
+
+    pub(super) fn get_node_directory(&self, inode: Inode) -> Result<&DirectoryNode> {
+        let node = self.storage.get(inode);
+        match node {
+            Some(Node::Directory(dir_node)) => Ok(dir_node),
+            _ => Err(FsError::BaseNotDirectory),
+        }
+    }
+
+    pub(super) fn get_node_directory_mut(&mut self, inode: Inode) -> Result<&mut DirectoryNode> {
+        let node = self.storage.get_mut(inode);
+        match node {
+            Some(Node::Directory(dir_node)) => Ok(dir_node),
+            _ => Err(FsError::BaseNotDirectory),
+        }
+    }
+
+    #[inline]
+    pub(super) fn absolute_path(&self, node: &Node) -> PathBuf {
+        let parent = self.get_node(node.parent_inode()).unwrap();
+        if parent.inode() == ROOT_INODE {
+            if let Some(parent) = &self.parent {
+                return parent.absolute_path().join(node.name());
+            }
+            return PathBuf::from("/").join(node.name());
+        }
+        self.absolute_path(parent).join(node.name())
+    }
+
+    fn read_dir_inode(&self, inode_of_directory: Inode) -> Result<ReadDir> {
+        // Check it's a directory and fetch the immediate children as `DirEntry`.
+        let inode = self
+            .storage
+            .get(inode_of_directory)
+            .ok_or(FsError::InvalidInput)?;
+        let base_path = self.absolute_path(inode);
+        let children = match inode {
+            Node::Directory(DirectoryNode { children, .. }) => children
+                .iter()
+                .filter_map(|inode| self.storage.get(*inode))
+                .map(|node| DirEntry {
+                    path: { base_path.join(node.name()) },
+                    metadata: Ok(node.metadata().clone()),
+                })
+                .collect(),
+
+            Node::ArcDirectory(ArcDirectoryNode { fs, path, .. }) => {
+                return fs.read_dir(path.as_path());
+            }
+
+            _ => return Err(FsError::InvalidInput),
+        };
+
+        Ok(ReadDir::new(children))
+    }
+
+    fn create_dir_inode(&mut self, inode: Inode, dir_name: OsString) -> Result<()> {
+        let node = self.get_node_directory(inode)?;
+        if node.children.iter().any(|child_inode| {
+            if let Some(node) = self.storage.get(*child_inode) {
+                return node.name() == dir_name;
+            }
+            false
+        }) {
+            return Err(FsError::AlreadyExists);
+        }
+
+        // Creating the directory in the storage.
+        let inode_of_directory = self.storage.vacant_entry().key();
+        let real_inode_of_directory = self.storage.insert(Node::Directory(DirectoryNode {
+            inode: inode_of_directory,
+            parent_inode: inode,
+            name: dir_name,
+            children: Vec::new(),
+            metadata: {
+                let time = time();
+
+                Metadata {
+                    ft: FileType::new_dir(),
+                    accessed: time,
+                    created: time,
+                    modified: time,
+                    len: 0,
+                }
+            },
+        }));
+
+        assert_eq!(
+            inode_of_directory, real_inode_of_directory,
+            "new directory inode should have been correctly calculated",
+        );
+
+        // Adding the new directory to its parent.
+        self.add_child_to_node(inode, inode_of_directory)?;
+
+        Ok(())
+    }
+
+    fn remove_dir_inode(&mut self, inode: Inode) -> Result<()> {
+        if inode == ROOT_INODE {
+            // We can't remove the root
+            return Err(FsError::BaseNotDirectory);
+        }
+        let node = self.get_node_directory(inode)?;
+        if !node.children.is_empty() {
+            return Err(FsError::DirectoryNotEmpty);
+        }
+        self.remove_inode_inside_dir(node.parent_inode, inode)
+    }
+
+    fn remove_inode_inside_dir(&mut self, inode: Inode, child: Inode) -> Result<()> {
+        let mut parent_node = self.get_node_directory_mut(inode)?;
+        let position = parent_node
+            .children
+            .iter()
+            .position(|&r| r == child)
+            .ok_or(FsError::EntryNotFound)?;
+
+        parent_node.metadata.modified = time();
+
+        // Remove the child from the parent directory.
+        self.remove_child_from_node(inode, position)?;
+
+        // Remove the directory from the storage.
+        self.storage.remove(child);
+
+        Ok(())
+    }
+
+    fn remove_file_inode(&mut self, inode: Inode) -> Result<()> {
+        let node = self.get_node(inode).ok_or(FsError::EntryNotFound)?;
+        self.remove_inode_inside_dir(node.parent_inode(), inode)
+    }
+
     /// Get the inode associated to a path if it exists.
     pub(super) fn inode_of(&self, path: &Path) -> Result<InodeResolution> {
         // SAFETY: The root node always exists, so it's safe to unwrap here.
@@ -659,14 +537,14 @@ impl FileSystemInner {
                     .filter_map(|inode| self.storage.get(*inode))
                     .find(|node| node.name() == component.as_os_str())
                     .ok_or(FsError::EntryNotFound)?,
-                Node::ArcDirectory(ArcDirectoryNode {
-                    fs, path: fs_path, ..
-                }) => {
-                    let mut path = fs_path.clone();
+                Node::ArcDirectory(ArcDirectoryNode { fs, .. }) => {
+                    let mut path = PathBuf::new();
                     path.push(PathBuf::from(component.as_os_str()));
                     for component in components.by_ref() {
                         path.push(PathBuf::from(component.as_os_str()));
                     }
+                    // let mut path: PathBuf = components.collect();
+                    // path.push(component.as_os_str());
                     return Ok(InodeResolution::Redirect(fs.clone(), path));
                 }
                 _ => return Err(FsError::BaseNotDirectory),
@@ -683,60 +561,16 @@ impl FileSystemInner {
             InodeResolution::Found(inode_of_parent) => {
                 // Ensure it is a directory.
                 match self.storage.get(inode_of_parent) {
-                    Some(Node::Directory(DirectoryNode { .. })) => {
+                    Some(Node::Directory(DirectoryNode { .. })) | Some(Node::ArcDirectory(_)) => {
                         Ok(InodeResolution::Found(inode_of_parent))
-                    }
-                    Some(Node::ArcDirectory(ArcDirectoryNode { fs, path, .. })) => {
-                        Ok(InodeResolution::Redirect(fs.clone(), path.clone()))
                     }
                     _ => Err(FsError::BaseNotDirectory),
                 }
             }
-            InodeResolution::Redirect(fs, path) => Ok(InodeResolution::Redirect(fs, path)),
-        }
-    }
-
-    /// From the inode of a parent node (so, a directory), returns the
-    /// child index of `name_of_directory` along with its inode.
-    pub(super) fn as_parent_get_position_and_inode_of_directory(
-        &self,
-        inode_of_parent: Inode,
-        name_of_directory: &OsString,
-        directory_must_be_empty: DirectoryMustBeEmpty,
-    ) -> Result<(usize, InodeResolution)> {
-        match self.storage.get(inode_of_parent) {
-            Some(Node::Directory(DirectoryNode { children, .. })) => children
-                .iter()
-                .enumerate()
-                .filter_map(|(nth, inode)| self.storage.get(*inode).map(|node| (nth, node)))
-                .find_map(|(nth, node)| match node {
-                    Node::Directory(DirectoryNode {
-                        inode,
-                        name,
-                        children,
-                        ..
-                    }) if name.as_os_str() == name_of_directory => {
-                        if directory_must_be_empty.no() || children.is_empty() {
-                            Some(Ok((nth, InodeResolution::Found(*inode))))
-                        } else {
-                            Some(Err(FsError::DirectoryNotEmpty))
-                        }
-                    }
-
-                    _ => None,
-                })
-                .ok_or(FsError::InvalidInput)
-                .and_then(identity), // flatten
-
-            Some(Node::ArcDirectory(ArcDirectoryNode {
-                fs, path: fs_path, ..
-            })) => {
-                let mut path = fs_path.clone();
-                path.push(name_of_directory);
-                Ok((0, InodeResolution::Redirect(fs.clone(), path)))
+            InodeResolution::Redirect(fs, path) => {
+                println!("Inode of parent found -> Redirect: {}", path.display());
+                Ok(InodeResolution::Redirect(fs, path))
             }
-
-            _ => Err(FsError::BaseNotDirectory),
         }
     }
 
@@ -756,7 +590,6 @@ impl FileSystemInner {
                     Node::File(FileNode { inode, name, .. })
                     | Node::ReadOnlyFile(ReadOnlyFileNode { inode, name, .. })
                     | Node::CustomFile(CustomFileNode { inode, name, .. })
-                    | Node::ArcFile(ArcFileNode { inode, name, .. })
                         if name.as_os_str() == name_of_file =>
                     {
                         Some(Some((nth, InodeResolution::Found(*inode))))
@@ -796,7 +629,6 @@ impl FileSystemInner {
                     | Node::Directory(DirectoryNode { inode, name, .. })
                     | Node::ReadOnlyFile(ReadOnlyFileNode { inode, name, .. })
                     | Node::CustomFile(CustomFileNode { inode, name, .. })
-                    | Node::ArcFile(ArcFileNode { inode, name, .. })
                         if name.as_os_str() == name_of =>
                     {
                         Some(Some((nth, InodeResolution::Found(*inode))))
@@ -957,7 +789,6 @@ impl fmt::Debug for FileSystemInner {
                     ty = match node {
                         Node::File { .. } => "file",
                         Node::ReadOnlyFile { .. } => "ro-file",
-                        Node::ArcFile { .. } => "arc-file",
                         Node::CustomFile { .. } => "custom-file",
                         Node::Directory { .. } => "dir",
                         Node::ArcDirectory { .. } => "arc-dir",
@@ -999,13 +830,12 @@ impl Default for FileSystemInner {
         let mut slab = Slab::new();
         slab.insert(Node::Directory(DirectoryNode {
             inode: ROOT_INODE,
+            // TODO: Fix this
+            parent_inode: ROOT_INODE,
             name: OsString::from("/"),
             children: Vec::new(),
             metadata: Metadata {
-                ft: FileType {
-                    dir: true,
-                    ..Default::default()
-                },
+                ft: FileType::new_dir(),
                 accessed: time,
                 created: time,
                 modified: time,
@@ -1015,24 +845,9 @@ impl Default for FileSystemInner {
 
         Self {
             storage: slab,
+            parent: None,
             limiter: None,
         }
-    }
-}
-
-#[allow(dead_code)] // The `No` variant.
-pub(super) enum DirectoryMustBeEmpty {
-    Yes,
-    No,
-}
-
-impl DirectoryMustBeEmpty {
-    pub(super) fn yes(&self) -> bool {
-        matches!(self, Self::Yes)
-    }
-
-    pub(super) fn no(&self) -> bool {
-        !self.yes()
     }
 }
 
@@ -1073,6 +888,18 @@ mod test_filesystem {
             "storage has a well-defined root",
         );
     }
+
+    // #[tokio::test]
+    // async fn test_create_dir_dot() {
+    //     let fs = FileSystem::default();
+    //     fs.create_dir(".").unwrap();
+
+    //     assert_eq!(
+    //         fs.create_dir(path!(".")),
+    //         Err(FsError::AlreadyExists),
+    //         "creating the root which already exists",
+    //     );
+    // }
 
     #[tokio::test]
     async fn test_create_dir() {
@@ -1307,6 +1134,7 @@ mod test_filesystem {
                 matches!(
                     fs_inner.storage.get(2),
                     Some(Node::Directory(DirectoryNode {
+                        parent_inode: 1,
                         inode: 2,
                         name,
                         children,
@@ -1320,6 +1148,7 @@ mod test_filesystem {
                     fs_inner.storage.get(3),
                     Some(Node::Directory(DirectoryNode {
                         inode: 3,
+                        parent_inode: ROOT_INODE,
                         name,
                         children,
                         ..
@@ -1332,6 +1161,7 @@ mod test_filesystem {
                     fs_inner.storage.get(4),
                     Some(Node::File(FileNode {
                         inode: 4,
+                        parent_inode: 3,
                         name,
                         ..
                     })) if name == "hello1.txt"
@@ -1343,6 +1173,7 @@ mod test_filesystem {
                     fs_inner.storage.get(5),
                     Some(Node::File(FileNode {
                         inode: 5,
+                        parent_inode: 3,
                         name,
                         ..
                     })) if name == "hello2.txt"
@@ -1395,8 +1226,9 @@ mod test_filesystem {
             );
             assert!(
                 matches!(
-                    fs_inner.storage.get(1),
+                    dbg!(fs_inner.storage.get(1)),
                     Some(Node::Directory(DirectoryNode {
+                        parent_inode: 3,
                         inode: 1,
                         name,
                         children,
@@ -1409,6 +1241,7 @@ mod test_filesystem {
                 matches!(
                     fs_inner.storage.get(2),
                     Some(Node::Directory(DirectoryNode {
+                        parent_inode: 1,
                         inode: 2,
                         name,
                         children,
@@ -1421,6 +1254,7 @@ mod test_filesystem {
                 matches!(
                     fs_inner.storage.get(3),
                     Some(Node::Directory(DirectoryNode {
+                        parent_inode: ROOT_INODE,
                         inode: 3,
                         name,
                         children,
@@ -1442,9 +1276,10 @@ mod test_filesystem {
             );
             assert!(
                 matches!(
-                    fs_inner.storage.get(5),
+                    dbg!(fs_inner.storage.get(5)),
                     Some(Node::File(FileNode {
                         inode: 5,
+                        parent_inode: 1,
                         name,
                         ..
                     })) if name == "world2.txt"
@@ -1835,11 +1670,9 @@ mod test_filesystem {
 
         let other: Arc<dyn crate::FileSystem + Send + Sync> = Arc::new(other);
 
-        main.mount_directory_entries(&Path::new("/"), &other, &Path::new("/a"))
-            .unwrap();
-
         let mut buf = Vec::new();
 
+        main.mount("/x".into(), &other, "/a/x".into()).unwrap();
         let mut f = main
             .new_open_options()
             .read(true)

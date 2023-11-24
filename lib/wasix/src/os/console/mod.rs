@@ -225,13 +225,7 @@ impl Console {
             .with_stdin(Box::new(self.stdin.clone()))
             .with_stdout(Box::new(self.stdout.clone()))
             .with_stderr(Box::new(self.stderr.clone()))
-            .prepare_webc_env(
-                prog,
-                &wasi_opts,
-                Some(&pkg),
-                self.runtime.clone(),
-                Some(root_fs),
-            )
+            .prepare_webc_env(prog, &wasi_opts, Some(&pkg), self.runtime.clone())
             // TODO: better error conversion
             .map_err(|err| SpawnError::Other(err.into()))?;
 
@@ -243,20 +237,6 @@ impl Console {
         }
 
         let wasi_process = env.process.clone();
-
-        if let Err(err) = env.uses(self.uses.clone()) {
-            let mut stderr = self.stderr.clone();
-            InlineWaker::block_on(async {
-                virtual_fs::AsyncWriteExt::write_all(
-                    &mut stderr,
-                    format!("{}\r\n", err).as_bytes(),
-                )
-                .await
-                .ok();
-            });
-            tracing::debug!("failed to load used dependency - {}", err);
-            return Err(SpawnError::BadRequest);
-        }
 
         // The custom readonly files have to be added after the uses packages
         // otherwise they will be overriden by their attached file systems

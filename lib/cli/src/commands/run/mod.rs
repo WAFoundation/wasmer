@@ -47,11 +47,90 @@ use wasmer_wasix::{
     },
     Runtime,
 };
-use webc::{metadata::Manifest, Container};
+use webc::{
+    metadata::{Manifest, UrlOrManifest},
+    AbstractWebc, Container, Volume,
+};
 
 use crate::{commands::run::wasi::Wasi, error::PrettyError, logging::Output, store::StoreOptions};
 
 const TICK: Duration = Duration::from_millis(250);
+
+use shared_buffer::OwnedBuffer;
+use std::borrow::Cow;
+
+#[derive(Debug)]
+struct WebcPatch {
+    pub(crate) base: Option<Container>,
+    pub patched_manifest: Manifest,
+}
+
+impl WebcPatch {
+    pub fn new(base: Container, uses: Vec<String>) -> Self {
+        let mut manifest = base.manifest().clone();
+        Self {
+            base: Some(base),
+            patched_manifest: Self::add_uses_to_manifest(manifest, uses),
+        }
+    }
+    fn add_uses_to_manifest(mut manifest: Manifest, uses: Vec<String>) -> Manifest {
+        for use_ in uses {
+            manifest
+                .use_map
+                .insert(use_.clone(), UrlOrManifest::RegistryDependentUrl(use_));
+        }
+        manifest
+    }
+    pub fn with_uses(uses: Vec<String>) -> Self {
+        let manifest = Manifest::default();
+        Self {
+            base: None,
+            patched_manifest: Self::add_uses_to_manifest(manifest, uses),
+        }
+    }
+}
+
+/// We use this to patch the dependencies at runtime
+/// So the user can do `--use` to set their own dependencies
+impl AbstractWebc for WebcPatch {
+    fn manifest(&self) -> &Manifest {
+        &self.patched_manifest
+    }
+
+    fn atom_names(&self) -> Vec<Cow<'_, str>> {
+        self.base
+            .as_ref()
+            .map(|base| {
+                base.atoms()
+                    .keys()
+                    .map(String::to_owned)
+                    .map(Cow::from)
+                    .collect()
+            })
+            .unwrap_or(vec![])
+    }
+
+    fn get_atom(&self, name: &str) -> Option<OwnedBuffer> {
+        self.base.as_ref().and_then(|base| base.get_atom(name))
+    }
+
+    fn volume_names(&self) -> Vec<Cow<'_, str>> {
+        self.base
+            .as_ref()
+            .map(|base| {
+                base.volumes()
+                    .keys()
+                    .map(String::to_owned)
+                    .map(Cow::from)
+                    .collect()
+            })
+            .unwrap_or(vec![])
+    }
+
+    fn get_volume(&self, name: &str) -> Option<Volume> {
+        self.base.as_ref().and_then(|base| base.get_volume(name))
+    }
+}
 
 /// The unstable `wasmer run` subcommand.
 #[derive(Debug, Parser)]
@@ -122,9 +201,33 @@ impl Run {
         let result = {
             match target {
                 ExecutableTarget::WebAssembly { module, path } => {
-                    self.execute_wasm(&path, &module, store, runtime)
+                    let pkg = if !self.wasi.uses.is_empty() {
+                        let patched_container =
+                            Container::new(WebcPatch::with_uses(self.wasi.uses.clone()));
+                        let inner_runtime = runtime.clone();
+                        let pkg = runtime.task_manager().spawn_and_block_on(async move {
+                            BinaryPackage::from_webc(&patched_container, inner_runtime.as_ref())
+                                .await
+                        })?;
+                        Some(pkg)
+                    } else {
+                        None
+                    };
+
+                    self.execute_wasm(&path, &module, store, pkg.as_ref(), runtime)
                 }
-                ExecutableTarget::Package(pkg) => self.execute_webc(&pkg, runtime),
+                ExecutableTarget::Container(container) => {
+                    pb.set_message("Resolving dependencies");
+
+                    let patched_container =
+                        Container::new(WebcPatch::new(container, self.wasi.uses.clone()));
+                    let inner_runtime = runtime.clone();
+                    let pkg = runtime.task_manager().spawn_and_block_on(async move {
+                        BinaryPackage::from_webc(&patched_container, inner_runtime.as_ref()).await
+                    })?;
+
+                    self.execute_webc(&pkg, runtime)
+                }
             }
         };
 
@@ -141,12 +244,13 @@ impl Run {
         path: &Path,
         module: &Module,
         mut store: Store,
+        pkg: Option<&BinaryPackage>,
         runtime: Arc<dyn Runtime + Send + Sync>,
     ) -> Result<(), Error> {
         if wasmer_emscripten::is_emscripten_module(module) {
             self.execute_emscripten_module()
         } else if wasmer_wasix::is_wasi_module(module) || wasmer_wasix::is_wasix_module(module) {
-            self.execute_wasi_module(path, module, runtime, store)
+            self.execute_wasi_module(path, module, runtime, pkg, store)
         } else {
             self.execute_pure_wasm_module(module, &mut store)
         }
@@ -228,12 +332,13 @@ impl Run {
     ) -> Result<(), Error> {
         let mut runner = wasmer_wasix::runners::wcgi::WcgiRunner::new();
 
+        let root_fs = self.wasi.get_fs()?;
         runner
             .config()
             .args(self.args.clone())
             .addr(self.wcgi.addr)
             .envs(self.wasi.env_vars.clone())
-            .map_directories(self.wasi.mapped_dirs.clone())
+            .with_fs(root_fs)
             .callbacks(Callbacks::new(self.wcgi.addr))
             .inject_packages(uses);
         *runner.config().capabilities() = self.wasi.capabilities();
@@ -298,8 +403,9 @@ impl Run {
             .with_args(&self.args)
             .with_injected_packages(packages)
             .with_envs(self.wasi.env_vars.clone())
+            .with_fs(self.wasi.get_fs()?)
+            .with_current_dir(PathBuf::from(Wasi::MAPPED_CURRENT_DIR_DEFAULT_PATH))
             .with_mapped_host_commands(self.wasi.build_mapped_commands()?)
-            .with_mapped_directories(self.wasi.build_mapped_directories()?)
             .with_forward_host_env(self.wasi.forward_host_env)
             .with_capabilities(self.wasi.capabilities());
 
@@ -312,15 +418,17 @@ impl Run {
         wasm_path: &Path,
         module: &Module,
         runtime: Arc<dyn Runtime + Send + Sync>,
+        pkg: Option<&BinaryPackage>,
         mut store: Store,
     ) -> Result<(), Error> {
         let program_name = wasm_path.display().to_string();
 
-        let runner = self.build_wasi_runner(&runtime)?;
+        let mut runner = self.build_wasi_runner(&runtime)?;
         runner.run_wasm(
             runtime,
             &program_name,
             module,
+            pkg,
             self.wasi.enable_async_threads,
         )
     }
@@ -488,10 +596,10 @@ impl PackageSource {
                 pb.set_message("Loading from the registry");
                 let inner_pck = pkg.clone();
                 let inner_rt = rt.clone();
-                let pkg = rt.task_manager().spawn_and_block_on(async move {
-                    BinaryPackage::from_registry(&inner_pck, inner_rt.as_ref()).await
+                let container = rt.task_manager().spawn_and_block_on(async move {
+                    BinaryPackage::get_container_from_registry(&inner_pck, inner_rt.as_ref()).await
                 })?;
-                Ok(ExecutableTarget::Package(pkg))
+                Ok(ExecutableTarget::Container(container))
             }
         }
     }
@@ -557,7 +665,7 @@ impl TargetOnDisk {
 #[derive(Debug, Clone)]
 enum ExecutableTarget {
     WebAssembly { module: Module, path: PathBuf },
-    Package(BinaryPackage),
+    Container(Container),
 }
 
 impl ExecutableTarget {
@@ -574,14 +682,7 @@ impl ExecutableTarget {
         let manifest_path = dir.join("wasmer.toml");
         let webc = webc::wasmer_package::Package::from_manifest(manifest_path)?;
         let container = Container::from(webc);
-
-        pb.set_message("Resolving dependencies");
-        let inner_runtime = runtime.clone();
-        let pkg = runtime.task_manager().spawn_and_block_on(async move {
-            BinaryPackage::from_webc(&container, inner_runtime.as_ref()).await
-        })?;
-
-        Ok(ExecutableTarget::Package(pkg))
+        Ok(ExecutableTarget::Container(container))
     }
 
     /// Try to load a file into something that can be used to run it.
@@ -619,13 +720,7 @@ impl ExecutableTarget {
             }
             TargetOnDisk::LocalWebc => {
                 let container = Container::from_disk(path)?;
-                pb.set_message("Resolving dependencies");
-
-                let inner_runtime = runtime.clone();
-                let pkg = runtime.task_manager().spawn_and_block_on(async move {
-                    BinaryPackage::from_webc(&container, inner_runtime.as_ref()).await
-                })?;
-                Ok(ExecutableTarget::Package(pkg))
+                Ok(ExecutableTarget::Container(container))
             }
         }
     }

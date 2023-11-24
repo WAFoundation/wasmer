@@ -291,27 +291,10 @@ fn count_file_system(fs: &dyn FileSystem, path: &Path) -> u64 {
 /// Given a set of [`ResolvedFileSystemMapping`]s and the [`Container`] for each
 /// package in a dependency tree, construct the resulting filesystem.
 ///
-/// # Note to future readers
-///
-/// Sooo... this code is a bit convoluted because we're constrained by the
-/// filesystem implementations we've got available.
-///
-/// Ideally, we would create a WebcVolumeFileSystem for each volume we're
-/// using, then we'd have a single "union" filesystem which lets you mount
-/// filesystem objects under various paths and can deal with conflicts.
-///
 /// The OverlayFileSystem lets us make files from multiple filesystem
 /// implementations available at the same time, however all of the
 /// filesystems will be mounted at "/", when the user wants to mount volumes
 /// at arbitrary locations.
-///
-/// The TmpFileSystem *does* allow mounting at non-root paths, however it can't
-/// handle nested paths (e.g. mounting to "/lib" and "/lib/python3.10" - see
-/// <https://github.com/wasmerio/wasmer/issues/3678> for more) and you aren't
-/// allowed to mount to "/" because it's a special directory that already
-/// exists.
-///
-/// As a result, we'll duct-tape things together and hope for the best 🤞
 fn filesystem(
     packages: &HashMap<PackageId, Container>,
     pkg: &ResolvedPackage,
@@ -324,9 +307,9 @@ fn filesystem(
 
     for ResolvedFileSystemMapping {
         mount_path,
+        original_path,
         volume_name,
         package,
-        original_path,
     } in &pkg.filesystem
     {
         // Note: We want to reuse existing Volume instances if we can. That way
@@ -346,17 +329,24 @@ fn filesystem(
             }
         };
 
-        let volume = container_volumes.get(volume_name).with_context(|| {
-            format!("The \"{package}\" package doesn't have a \"{volume_name}\" volume")
-        })?;
+        let volume = if let Some(volume) = container_volumes.get(volume_name) {
+            volume
+        } else {
+            tracing::debug!("The \"{package}\" package doesn't have a \"{volume_name}\" volume");
+            continue;
+        };
 
         let original_path = PathBuf::from(original_path);
-        let mount_path = mount_path.clone();
-        // Get a filesystem which will map "$mount_dir/some-path" to
-        // "$original_path/some-path" on the original volume
+        let mount_path = if mount_path.is_relative() {
+            PathBuf::from("/home").join(mount_path)
+        } else {
+            mount_path.clone()
+        };
+
+        // let fs = WebcVolumeFileSystem::new(volume.clone());
         let fs =
             MappedPathFileSystem::new(WebcVolumeFileSystem::new(volume.clone()), move |path| {
-                let without_mount_dir = path
+                let without_mount_dir: &Path = path
                     .strip_prefix(&mount_path)
                     .map_err(|_| virtual_fs::FsError::BaseNotDirectory)?;
                 let path_on_original_volume = original_path.join(without_mount_dir);
@@ -400,6 +390,9 @@ where
     F: FileSystem,
     M: Fn(&Path) -> Result<PathBuf, virtual_fs::FsError> + Send + Sync + 'static,
 {
+    fn as_dir(&self) -> Box<dyn virtual_fs::Directory + Send + Sync> {
+        self.inner.as_dir()
+    }
     fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
         let path = self.path(path)?;
         self.inner.read_dir(&path)

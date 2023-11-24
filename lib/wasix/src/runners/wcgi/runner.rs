@@ -7,6 +7,8 @@ use hyper::Body;
 use tower::{make::Shared, ServiceBuilder};
 use tower_http::{catch_panic::CatchPanicLayer, cors::CorsLayer, trace::TraceLayer};
 use tracing::Span;
+use virtual_fs::RootFileSystemBuilder;
+use virtual_fs::TmpFileSystem;
 use wcgi_host::CgiDialect;
 use webc::metadata::{
     annotations::{Wasi, Wcgi},
@@ -62,12 +64,18 @@ impl WcgiRunner {
             None => CgiDialect::Wcgi,
         };
 
-        let container_fs = Arc::clone(&pkg.webc_fs);
-
         let wasi_common = self.config.wasi.clone();
         let rt = Arc::clone(&runtime);
+
+        let root_fs = wasi_common
+            .fs
+            .clone()
+            .unwrap_or_else(|| RootFileSystemBuilder::default().build());
+
+        let pkg = pkg.clone();
         let setup_builder = move |builder: &mut WasiEnvBuilder| {
-            wasi_common.prepare_webc_env(builder, Some(Arc::clone(&container_fs)), &wasi, None)?;
+            wasi_common.prepare_webc_env(builder, &wasi, Some(&pkg))?;
+            wasi_common.set_filesystem(builder, root_fs.clone())?;
             builder.set_runtime(Arc::clone(&rt));
 
             Ok(())
@@ -157,6 +165,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// Builder method to provide a filesystem to the runner
+    pub fn with_fs(&mut self, fs: TmpFileSystem) -> &mut Self {
+        self.wasi.fs = Some(fs);
+        self
+    }
+
     pub fn addr(&mut self, addr: SocketAddr) -> &mut Self {
         self.addr = addr;
         self
@@ -180,7 +194,7 @@ impl Config {
 
     /// Expose an environment variable to the guest.
     pub fn env(&mut self, name: impl Into<String>, value: impl Into<String>) -> &mut Self {
-        self.wasi.env.insert(name.into(), value.into());
+        self.wasi.env.push((name.into(), value.into()));
         self
     }
 

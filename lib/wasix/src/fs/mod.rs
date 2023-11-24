@@ -4,7 +4,7 @@ mod notification;
 
 use std::{
     borrow::{Borrow, Cow},
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -19,12 +19,12 @@ use crate::{
     net::socket::InodeSocketKind,
     state::{Stderr, Stdin, Stdout},
 };
-use futures::{future::BoxFuture, Future, TryStreamExt};
+use futures::Future;
 #[cfg(feature = "enable-serde")]
 use serde_derive::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, trace};
-use virtual_fs::{copy_reference, FileSystem, FsError, OpenOptions, VirtualFile};
+use virtual_fs::{FileSystem, FsError, VirtualFile};
 use wasmer_wasix_types::{
     types::{__WASI_STDERR_FILENO, __WASI_STDIN_FILENO, __WASI_STDOUT_FILENO},
     wasi::{
@@ -40,7 +40,7 @@ pub(crate) use self::inode_guard::{
 };
 pub use self::notification::NotificationInner;
 use crate::syscalls::map_io_err;
-use crate::{bin_factory::BinaryPackage, state::PreopenedDir, ALL_RIGHTS};
+use crate::{state::PreopenedDir, ALL_RIGHTS};
 
 /// the fd value of the virtual root
 pub const VIRTUAL_ROOT_FD: WasiFd = 3;
@@ -268,148 +268,6 @@ impl Default for WasiInodes {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum WasiFsRoot {
-    Sandbox(Arc<virtual_fs::tmp_fs::TmpFileSystem>),
-    Backing(Arc<Box<dyn FileSystem>>),
-}
-
-impl WasiFsRoot {
-    /// Merge the contents of a filesystem into this one.
-    pub(crate) async fn merge(
-        &self,
-        other: &Arc<dyn FileSystem + Send + Sync>,
-    ) -> Result<(), virtual_fs::FsError> {
-        match self {
-            WasiFsRoot::Sandbox(fs) => {
-                fs.union(other);
-                Ok(())
-            }
-            WasiFsRoot::Backing(fs) => {
-                merge_filesystems(other, fs).await?;
-                Ok(())
-            }
-        }
-    }
-}
-
-impl FileSystem for WasiFsRoot {
-    fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
-        match self {
-            WasiFsRoot::Sandbox(fs) => fs.read_dir(path),
-            WasiFsRoot::Backing(fs) => fs.read_dir(path),
-        }
-    }
-    fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
-        match self {
-            WasiFsRoot::Sandbox(fs) => fs.create_dir(path),
-            WasiFsRoot::Backing(fs) => fs.create_dir(path),
-        }
-    }
-    fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
-        match self {
-            WasiFsRoot::Sandbox(fs) => fs.remove_dir(path),
-            WasiFsRoot::Backing(fs) => fs.remove_dir(path),
-        }
-    }
-    fn rename<'a>(&'a self, from: &Path, to: &Path) -> BoxFuture<'a, virtual_fs::Result<()>> {
-        let from = from.to_owned();
-        let to = to.to_owned();
-        let this = self.clone();
-        Box::pin(async move {
-            match this {
-                WasiFsRoot::Sandbox(fs) => fs.rename(&from, &to).await,
-                WasiFsRoot::Backing(fs) => fs.rename(&from, &to).await,
-            }
-        })
-    }
-    fn metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
-        match self {
-            WasiFsRoot::Sandbox(fs) => fs.metadata(path),
-            WasiFsRoot::Backing(fs) => fs.metadata(path),
-        }
-    }
-    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
-        match self {
-            WasiFsRoot::Sandbox(fs) => fs.symlink_metadata(path),
-            WasiFsRoot::Backing(fs) => fs.symlink_metadata(path),
-        }
-    }
-    fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
-        match self {
-            WasiFsRoot::Sandbox(fs) => fs.remove_file(path),
-            WasiFsRoot::Backing(fs) => fs.remove_file(path),
-        }
-    }
-    fn new_open_options(&self) -> OpenOptions {
-        match self {
-            WasiFsRoot::Sandbox(fs) => fs.new_open_options(),
-            WasiFsRoot::Backing(fs) => fs.new_open_options(),
-        }
-    }
-}
-
-/// Merge the contents of one filesystem into another.
-///
-#[tracing::instrument(level = "debug", skip_all)]
-async fn merge_filesystems(
-    source: &dyn FileSystem,
-    destination: &dyn FileSystem,
-) -> Result<(), virtual_fs::FsError> {
-    tracing::debug!("Falling back to a recursive copy to merge filesystems");
-    let files = futures::stream::FuturesUnordered::new();
-
-    let mut to_check = VecDeque::new();
-    to_check.push_back(PathBuf::from("/"));
-
-    while let Some(path) = to_check.pop_front() {
-        let metadata = match source.metadata(&path) {
-            Ok(m) => m,
-            Err(err) => {
-                tracing::debug!(path=%path.display(), source_fs=?source, ?err, "failed to get metadata for path while merging file systems");
-                return Err(err);
-            }
-        };
-
-        if metadata.is_dir() {
-            create_dir_all(destination, &path)?;
-
-            for entry in source.read_dir(&path)? {
-                let entry = entry?;
-                to_check.push_back(entry.path);
-            }
-        } else if metadata.is_file() {
-            files.push(async move {
-                copy_reference(source, destination, &path)
-                    .await
-                    .map_err(virtual_fs::FsError::from)
-            });
-        } else {
-            tracing::debug!(
-                path=%path.display(),
-                ?metadata,
-                "Skipping unknown file type while merging"
-            );
-        }
-    }
-
-    files.try_collect().await
-}
-
-fn create_dir_all(fs: &dyn FileSystem, path: &Path) -> Result<(), virtual_fs::FsError> {
-    if fs.metadata(path).is_ok() {
-        return Ok(());
-    }
-
-    if let Some(parent) = path.parent() {
-        create_dir_all(fs, parent)?;
-    }
-
-    fs.create_dir(path)?;
-
-    Ok(())
-}
-
 /// Warning, modifying these fields directly may cause invariants to break and
 /// should be considered unsafe.  These fields may be made private in a future release
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
@@ -420,7 +278,7 @@ pub struct WasiFs {
     pub next_fd: AtomicU32,
     pub current_dir: Mutex<String>,
     #[cfg_attr(feature = "enable-serde", serde(skip, default))]
-    pub root_fs: WasiFsRoot,
+    pub root_fs: Arc<dyn FileSystem>,
     pub root_inode: InodeGuard,
     pub has_unioned: Arc<Mutex<HashSet<String>>>,
 
@@ -487,38 +345,12 @@ impl WasiFs {
         );
     }
 
-    /// Will conditionally union the binary file system with this one
-    /// if it has not already been unioned
-    pub async fn conditional_union(
-        &self,
-        binary: &BinaryPackage,
-    ) -> Result<(), virtual_fs::FsError> {
-        let package_name = binary.package_name.clone();
-
-        let needs_to_be_unioned = self.has_unioned.lock().unwrap().insert(package_name);
-
-        if !needs_to_be_unioned {
-            return Ok(());
-        }
-
-        match self.root_fs {
-            WasiFsRoot::Sandbox(ref sandbox_fs) => {
-                sandbox_fs.union(&binary.webc_fs);
-            }
-            WasiFsRoot::Backing(ref fs) => {
-                merge_filesystems(&binary.webc_fs, fs.deref()).await?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Created for the builder API. like `new` but with more information
     pub(crate) fn new_with_preopen(
         inodes: &WasiInodes,
         preopens: &[PreopenedDir],
         vfs_preopens: &[String],
-        fs_backing: WasiFsRoot,
+        fs_backing: Arc<dyn FileSystem>,
     ) -> Result<Self, String> {
         let (wasi_fs, root_inode) = Self::new_init(fs_backing, inodes)?;
 
@@ -694,19 +526,22 @@ impl WasiFs {
 
     /// Converts a relative path into an absolute path
     pub(crate) fn relative_path_to_absolute(&self, mut path: String) -> String {
-        if path.starts_with("./") {
+        if !path.starts_with("/") {
             let current_dir = self.current_dir.lock().unwrap();
-            path = format!("{}{}", current_dir.as_str(), &path[1..]);
-            if path.contains("//") {
-                path = path.replace("//", "/");
-            }
+            path = PathBuf::from(current_dir.as_str())
+                .join(path)
+                .to_string_lossy()
+                .to_string();
         }
         path
     }
 
     /// Private helper function to init the filesystem, called in `new` and
     /// `new_with_preopen`
-    fn new_init(fs_backing: WasiFsRoot, inodes: &WasiInodes) -> Result<(Self, InodeGuard), String> {
+    fn new_init(
+        fs_backing: Arc<dyn FileSystem>,
+        inodes: &WasiInodes,
+    ) -> Result<(Self, InodeGuard), String> {
         debug!("Initializing WASI filesystem");
 
         let stat = Filestat {
@@ -1398,13 +1233,21 @@ impl WasiFs {
         follow_symlinks: bool,
     ) -> Result<InodeGuard, Errno> {
         let base_inode = self.get_fd_inode(base)?;
-        let start_inode =
-            if !base_inode.deref().name.starts_with('/') && self.is_wasix.load(Ordering::Acquire) {
-                let (cur_inode, _) = self.get_current_dir(inodes, base)?;
-                cur_inode
-            } else {
-                self.get_fd_inode(base)?
-            };
+        println!(
+            "get_inode_at_path, path: {}, base name: {} (inode: {})",
+            path,
+            base_inode.deref().name,
+            base
+        );
+        let start_inode = if (!base_inode.deref().name.starts_with('/')
+            || (base_inode.deref().name == "/" && !path.starts_with('/')))
+            && self.is_wasix.load(Ordering::Acquire)
+        {
+            let (cur_inode, _) = self.get_current_dir(inodes, base)?;
+            cur_inode
+        } else {
+            self.get_fd_inode(base)?
+        };
         self.get_inode_at_path_inner(inodes, start_inode, path, 0, follow_symlinks)
     }
 
@@ -1898,55 +1741,6 @@ impl std::fmt::Debug for WasiFs {
         }
         write!(f, "next_fd={} ", self.next_fd.load(Ordering::Relaxed))?;
         write!(f, "{:?}", self.root_fs)
-    }
-}
-
-/// Returns the default filesystem backing
-pub fn default_fs_backing() -> Box<dyn virtual_fs::FileSystem + Send + Sync> {
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "host-fs")] {
-            Box::<virtual_fs::host_fs::FileSystem>::default()
-        } else if #[cfg(not(feature = "host-fs"))] {
-            Box::<virtual_fs::mem_fs::FileSystem>::default()
-        } else {
-            Box::<FallbackFileSystem>::default()
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct FallbackFileSystem;
-
-impl FallbackFileSystem {
-    fn fail() -> ! {
-        panic!("No filesystem set for wasmer-wasi, please enable either the `host-fs` or `mem-fs` feature or set your custom filesystem with `WasiEnvBuilder::set_fs`");
-    }
-}
-
-impl FileSystem for FallbackFileSystem {
-    fn read_dir(&self, _path: &Path) -> Result<virtual_fs::ReadDir, FsError> {
-        Self::fail();
-    }
-    fn create_dir(&self, _path: &Path) -> Result<(), FsError> {
-        Self::fail();
-    }
-    fn remove_dir(&self, _path: &Path) -> Result<(), FsError> {
-        Self::fail();
-    }
-    fn rename<'a>(&'a self, _from: &Path, _to: &Path) -> BoxFuture<'a, Result<(), FsError>> {
-        Self::fail();
-    }
-    fn metadata(&self, _path: &Path) -> Result<virtual_fs::Metadata, FsError> {
-        Self::fail();
-    }
-    fn symlink_metadata(&self, _path: &Path) -> Result<virtual_fs::Metadata, FsError> {
-        Self::fail();
-    }
-    fn remove_file(&self, _path: &Path) -> Result<(), FsError> {
-        Self::fail();
-    }
-    fn new_open_options(&self) -> virtual_fs::OpenOptions {
-        Self::fail();
     }
 }
 

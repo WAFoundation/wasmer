@@ -26,24 +26,24 @@ use std::task::{Context, Poll};
 /// delegated to the file itself.
 pub(super) struct FileHandle {
     inode: Inode,
+    unique_id: usize,
     filesystem: FileSystem,
     readable: bool,
     writable: bool,
     append_mode: bool,
     cursor: u64,
-    arc_file: Option<Result<Box<dyn VirtualFile + Send + Sync + 'static>>>,
 }
 
 impl Clone for FileHandle {
     fn clone(&self) -> Self {
         Self {
             inode: self.inode,
+            unique_id: self.unique_id,
             filesystem: self.filesystem.clone(),
             readable: self.readable,
             writable: self.writable,
             append_mode: self.append_mode,
             cursor: self.cursor,
-            arc_file: None,
         }
     }
 }
@@ -59,48 +59,27 @@ impl FileHandle {
     ) -> Self {
         Self {
             inode,
+            unique_id: crate::generate_next_unique_id(),
             filesystem,
             readable,
             writable,
             append_mode,
             cursor,
-            arc_file: None,
         }
-    }
-
-    fn lazy_load_arc_file_mut(&mut self) -> Result<&mut dyn VirtualFile> {
-        if self.arc_file.is_none() {
-            let fs = match self.filesystem.inner.read() {
-                Ok(fs) => fs,
-                _ => return Err(FsError::EntryNotFound),
-            };
-
-            let inode = fs.storage.get(self.inode);
-            match inode {
-                Some(Node::ArcFile(node)) => {
-                    self.arc_file.replace(
-                        node.fs
-                            .new_open_options()
-                            .read(self.readable)
-                            .write(self.writable)
-                            .append(self.append_mode)
-                            .open(node.path.as_path()),
-                    );
-                }
-                _ => return Err(FsError::EntryNotFound),
-            }
-        }
-        Ok(self
-            .arc_file
-            .as_mut()
-            .unwrap()
-            .as_mut()
-            .map_err(|err| *err)?
-            .as_mut())
     }
 }
 
 impl VirtualFile for FileHandle {
+    fn absolute_path(&self) -> PathBuf {
+        let guard = self.filesystem.inner.read().unwrap();
+        let node = guard.get_node(self.inode).unwrap();
+        guard.absolute_path(node)
+    }
+
+    fn unique_id(&self) -> usize {
+        self.unique_id
+    }
+
     fn last_accessed(&self) -> u64 {
         let fs = match self.filesystem.inner.read() {
             Ok(fs) => fs,
@@ -156,18 +135,6 @@ impl VirtualFile for FileHandle {
                 let file = node.file.lock().unwrap();
                 file.size()
             }
-            Some(Node::ArcFile(node)) => match self.arc_file.as_ref() {
-                Some(file) => file.as_ref().map(|file| file.size()).unwrap_or(0),
-                None => node
-                    .fs
-                    .new_open_options()
-                    .read(self.readable)
-                    .write(self.writable)
-                    .append(self.append_mode)
-                    .open(node.path.as_path())
-                    .map(|file| file.size())
-                    .unwrap_or(0),
-            },
             _ => 0,
         }
     }
@@ -188,11 +155,6 @@ impl VirtualFile for FileHandle {
                 node.metadata.len = new_size;
             }
             Some(Node::ReadOnlyFile { .. }) => return Err(FsError::PermissionDenied),
-            Some(Node::ArcFile { .. }) => {
-                drop(fs);
-                let file = self.lazy_load_arc_file_mut()?;
-                file.set_len(new_size)?;
-            }
             _ => return Err(FsError::NotAFile),
         }
 
@@ -262,21 +224,6 @@ impl VirtualFile for FileHandle {
                 let file = node.file.lock().unwrap();
                 file.get_special_fd()
             }
-            Some(Node::ArcFile(node)) => match self.arc_file.as_ref() {
-                Some(file) => file
-                    .as_ref()
-                    .map(|file| file.get_special_fd())
-                    .unwrap_or(None),
-                None => node
-                    .fs
-                    .new_open_options()
-                    .read(self.readable)
-                    .write(self.writable)
-                    .append(self.append_mode)
-                    .open(node.path.as_path())
-                    .map(|file| file.get_special_fd())
-                    .unwrap_or(None),
-            },
             _ => None,
         }
     }
@@ -292,10 +239,7 @@ impl VirtualFile for FileHandle {
             match inode {
                 Some(inode) => {
                     let metadata = Metadata {
-                        ft: crate::FileType {
-                            file: true,
-                            ..Default::default()
-                        },
+                        ft: crate::FileType::new_file(),
                         accessed: src.last_accessed(),
                         created: src.created_time(),
                         modified: src.last_modified(),
@@ -304,6 +248,7 @@ impl VirtualFile for FileHandle {
 
                     *inode = Node::CustomFile(CustomFileNode {
                         inode: inode.inode(),
+                        parent_inode: inode.parent_inode(),
                         name: inode.name().to_string_lossy().to_string().into(),
                         file: Mutex::new(Box::new(CopyOnWriteFile::new(src))),
                         metadata,
@@ -315,7 +260,7 @@ impl VirtualFile for FileHandle {
         })
     }
 
-    fn poll_read_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+    fn poll_read_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         if !self.readable {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -346,19 +291,6 @@ impl VirtualFile for FileHandle {
                 let file = Pin::new(file.as_mut());
                 file.poll_read_ready(cx)
             }
-            Some(Node::ArcFile(_)) => {
-                drop(fs);
-                match self.lazy_load_arc_file_mut() {
-                    Ok(file) => {
-                        let file = Pin::new(file);
-                        file.poll_read_ready(cx)
-                    }
-                    Err(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("inode `{}` doesn't match a file", self.inode),
-                    ))),
-                }
-            }
             _ => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("inode `{}` doesn't match a file", self.inode),
@@ -366,7 +298,7 @@ impl VirtualFile for FileHandle {
         }
     }
 
-    fn poll_write_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+    fn poll_write_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         if !self.readable {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -390,19 +322,6 @@ impl VirtualFile for FileHandle {
                 let mut file = node.file.lock().unwrap();
                 let file = Pin::new(file.as_mut());
                 file.poll_read_ready(cx)
-            }
-            Some(Node::ArcFile(_)) => {
-                drop(fs);
-                match self.lazy_load_arc_file_mut() {
-                    Ok(file) => {
-                        let file = Pin::new(file);
-                        file.poll_read_ready(cx)
-                    }
-                    Err(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("inode `{}` doesn't match a file", self.inode),
-                    ))),
-                }
             }
             _ => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -640,21 +559,6 @@ impl AsyncRead for FileHandle {
                     let file = Pin::new(file.as_mut());
                     file.poll_read(cx, buf)
                 }
-                Some(Node::ArcFile(_)) => {
-                    drop(fs);
-                    match self.lazy_load_arc_file_mut() {
-                        Ok(file) => {
-                            let file = Pin::new(file);
-                            file.poll_read(cx, buf)
-                        }
-                        Err(_) => {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!("inode `{}` doesn't match a file", self.inode),
-                            )))
-                        }
-                    }
-                }
                 _ => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -695,21 +599,6 @@ impl AsyncSeek for FileHandle {
                     let file = Pin::new(file.as_mut());
                     file.start_seek(position)
                 }
-                Some(Node::ArcFile(_)) => {
-                    drop(fs);
-                    match self.lazy_load_arc_file_mut() {
-                        Ok(file) => {
-                            let file = Pin::new(file);
-                            file.start_seek(position)
-                        }
-                        Err(_) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!("inode `{}` doesn't match a file", self.inode),
-                            ));
-                        }
-                    }
-                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -722,7 +611,7 @@ impl AsyncSeek for FileHandle {
         ret
     }
 
-    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         // In `append` mode, it's not possible to seek in the file. In
         // [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html),
         // the `O_APPEND` option describes this behavior well:
@@ -754,19 +643,6 @@ impl AsyncSeek for FileHandle {
                 let mut file = node.file.lock().unwrap();
                 let file = Pin::new(file.as_mut());
                 file.poll_complete(cx)
-            }
-            Some(Node::ArcFile { .. }) => {
-                drop(fs);
-                match self.lazy_load_arc_file_mut() {
-                    Ok(file) => {
-                        let file = Pin::new(file);
-                        file.poll_complete(cx)
-                    }
-                    Err(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("inode `{}` doesn't match a file", self.inode),
-                    ))),
-                }
             }
             _ => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -831,21 +707,6 @@ impl AsyncWrite for FileHandle {
                     node.metadata.len = guard.size();
                     bytes_written
                 }
-                Some(Node::ArcFile(_)) => {
-                    drop(fs);
-                    match self.lazy_load_arc_file_mut() {
-                        Ok(file) => {
-                            let file = Pin::new(file);
-                            return file.poll_write(cx, buf);
-                        }
-                        Err(_) => {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!("inode `{}` doesn't match a file", self.inode),
-                            )))
-                        }
-                    }
-                }
                 _ => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -894,19 +755,6 @@ impl AsyncWrite for FileHandle {
                     let file = Pin::new(file.as_mut());
                     file.poll_write_vectored(cx, bufs)
                 }
-                Some(Node::ArcFile(_)) => {
-                    drop(fs);
-                    match self.lazy_load_arc_file_mut() {
-                        Ok(file) => {
-                            let file = Pin::new(file);
-                            file.poll_write_vectored(cx, bufs)
-                        }
-                        Err(_) => Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("inode `{}` doesn't match a file", self.inode),
-                        ))),
-                    }
-                }
                 _ => Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("inode `{}` doesn't match a file", self.inode),
@@ -917,7 +765,7 @@ impl AsyncWrite for FileHandle {
         ret
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut fs =
             self.filesystem.inner.write().map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "failed to acquire a write lock")
@@ -932,19 +780,6 @@ impl AsyncWrite for FileHandle {
                 let file = Pin::new(file.as_mut());
                 file.poll_flush(cx)
             }
-            Some(Node::ArcFile { .. }) => {
-                drop(fs);
-                match self.lazy_load_arc_file_mut() {
-                    Ok(file) => {
-                        let file = Pin::new(file);
-                        file.poll_flush(cx)
-                    }
-                    Err(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("inode `{}` doesn't match a file", self.inode),
-                    ))),
-                }
-            }
             _ => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("inode `{}` doesn't match a file", self.inode),
@@ -952,7 +787,7 @@ impl AsyncWrite for FileHandle {
         }
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut fs =
             self.filesystem.inner.write().map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "failed to acquire a write lock")
@@ -966,19 +801,6 @@ impl AsyncWrite for FileHandle {
                 let mut file = node.file.lock().unwrap();
                 let file = Pin::new(file.as_mut());
                 file.poll_shutdown(cx)
-            }
-            Some(Node::ArcFile { .. }) => {
-                drop(fs);
-                match self.lazy_load_arc_file_mut() {
-                    Ok(file) => {
-                        let file = Pin::new(file);
-                        file.poll_shutdown(cx)
-                    }
-                    Err(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("inode `{}` doesn't match a file", self.inode),
-                    ))),
-                }
             }
             _ => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1000,13 +822,6 @@ impl AsyncWrite for FileHandle {
             Some(Node::CustomFile(node)) => {
                 let file = node.file.lock().unwrap();
                 file.is_write_vectored()
-            }
-            Some(Node::ArcFile { .. }) => {
-                drop(fs);
-                match self.arc_file.as_ref() {
-                    Some(Ok(file)) => file.is_write_vectored(),
-                    _ => false,
-                }
             }
             _ => false,
         }
