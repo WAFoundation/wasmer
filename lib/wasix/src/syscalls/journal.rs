@@ -14,7 +14,7 @@ pub fn maybe_snapshot_once<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     trigger: crate::journal::SnapshotTrigger,
 ) -> WasiResult<FunctionEnvMut<'_, WasiEnv>> {
-    use crate::os::task::process::{WasiProcessCheckpoint, WasiProcessInner};
+    use crate::os::task::process::{ProcessCheckpoint, WasiProcessInner};
 
     unsafe { handle_rewind_ext::<M, ()>(&mut ctx, HandleRewindType::Resultless) };
 
@@ -23,11 +23,11 @@ pub fn maybe_snapshot_once<M: MemorySize>(
     }
 
     if ctx.data_mut().pop_snapshot_trigger(trigger) {
-        let inner = ctx.data().process.inner.clone();
+        let process = ctx.data().process.clone();
         let res = wasi_try_ok_ok!(WasiProcessInner::checkpoint::<M>(
-            inner,
+            process,
             ctx,
-            WasiProcessCheckpoint::Snapshot { trigger },
+            ProcessCheckpoint::Snapshot { trigger },
         )?);
         match res {
             MaybeCheckpointResult::Unwinding => return Ok(Err(Errno::Success)),
@@ -51,14 +51,14 @@ pub fn maybe_snapshot<M: MemorySize>(
 pub fn maybe_snapshot<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
 ) -> WasiResult<FunctionEnvMut<'_, WasiEnv>> {
-    use crate::os::task::process::{WasiProcessCheckpoint, WasiProcessInner};
+    use crate::os::task::process::{ProcessCheckpoint, WasiProcessInner};
 
     if !ctx.data().enable_journal {
         return Ok(Ok(ctx));
     }
 
-    let inner = ctx.data().process.inner.clone();
-    let res = wasi_try_ok_ok!(WasiProcessInner::maybe_checkpoint::<M>(inner, ctx)?);
+    let process = ctx.data().process.clone();
+    let res = wasi_try_ok_ok!(WasiProcessInner::maybe_checkpoint::<M>(process, ctx)?);
     match res {
         MaybeCheckpointResult::Unwinding => return Ok(Err(Errno::Success)),
         MaybeCheckpointResult::NotThisTime(c) => {
@@ -102,7 +102,7 @@ pub unsafe fn restore_snapshot(
     stderr_fds.insert(2 as WasiFd);
 
     // Loop through all the events and process them
-    let cur_module_hash = Some(ctx.data().process.module_hash.as_bytes());
+    let cur_module_hash = Some(ctx.data().process.module_hash().as_bytes());
     let mut journal_module_hash = None;
     let mut rewind = None;
     while let Some(next) = journal.read().map_err(anyhow_err_to_runtime_err)? {

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
-    sync::{Arc, Condvar, Mutex, Weak},
+    sync::{Arc, Mutex},
     task::Waker,
 };
 
@@ -15,14 +15,11 @@ use wasmer_wasix_types::{
     wasi::{Errno, ExitCode},
 };
 
-use crate::{
-    os::task::process::{WasiProcessId, WasiProcessInner},
-    syscalls::HandleRewindType,
-    WasiRuntimeError,
-};
+use crate::{os::task::process::WasiProcessId, syscalls::HandleRewindType, WasiRuntimeError};
 
 use super::{
     control_plane::TaskCountGuard,
+    process::WasiProcessHandle,
     task_join_handle::{OwnedTaskStatus, TaskJoinHandle},
 };
 
@@ -278,21 +275,6 @@ impl WasiThread {
         self.state.status.set_running();
     }
 
-    /// Gets or sets the exit code based of a signal that was received
-    /// Note: if the exit code was already set earlier this method will
-    /// just return that earlier set exit code
-    pub fn set_or_get_exit_code_for_signal(&self, sig: Signal) -> ExitCode {
-        let default_exitcode: ExitCode = match sig {
-            Signal::Sigquit | Signal::Sigabrt => Errno::Success.into(),
-            _ => Errno::Intr.into(),
-        };
-        // This will only set the status code if its not already set
-        self.set_status_finished(Ok(default_exitcode));
-        self.try_join()
-            .map(|r| r.unwrap_or(default_exitcode))
-            .unwrap_or(default_exitcode)
-    }
-
     /// Marks the thread as finished (which will cause anyone that
     /// joined on it to wake up)
     pub fn set_status_finished(&self, res: Result<ExitCode, WasiRuntimeError>) {
@@ -494,7 +476,7 @@ impl WasiThread {
 #[derive(Debug)]
 pub struct WasiThreadHandleProtected {
     thread: WasiThread,
-    inner: Weak<(Mutex<WasiProcessInner>, Condvar)>,
+    process: WasiProcessHandle,
 }
 
 #[derive(Debug, Clone)]
@@ -503,14 +485,11 @@ pub struct WasiThreadHandle {
 }
 
 impl WasiThreadHandle {
-    pub(crate) fn new(
-        thread: WasiThread,
-        inner: &Arc<(Mutex<WasiProcessInner>, Condvar)>,
-    ) -> WasiThreadHandle {
+    pub(crate) fn new(thread: WasiThread, proc: WasiProcessHandle) -> WasiThreadHandle {
         Self {
             protected: Arc::new(WasiThreadHandleProtected {
                 thread,
-                inner: Arc::downgrade(inner),
+                process: proc,
             }),
         }
     }
@@ -527,8 +506,8 @@ impl WasiThreadHandle {
 impl Drop for WasiThreadHandleProtected {
     fn drop(&mut self) {
         let id = self.thread.tid();
-        if let Some(inner) = Weak::upgrade(&self.inner) {
-            let mut inner = inner.0.lock().unwrap();
+        if let Some(proc) = self.process.upgrade() {
+            let mut inner = proc.lock();
             if let Some(ctrl) = inner.threads.remove(&id) {
                 ctrl.set_status_finished(Ok(Errno::Success.into()));
             }
