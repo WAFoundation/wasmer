@@ -546,6 +546,9 @@ impl WritableJournal for CompactingJournalTx {
             }
             JournalEntry::OpenFileDescriptorV1 {
                 fd, o_flags, path, ..
+            }
+            | JournalEntry::OpenFileDescriptorV2 {
+                fd, o_flags, path, ..
             } => {
                 // Creating a file and erasing anything that was there before means
                 // the entire create branch that exists before this one can be ignored
@@ -607,6 +610,7 @@ impl WritableJournal for CompactingJournalTx {
             }
             // Seeks to a particular position within
             JournalEntry::FileDescriptorSeekV1 { fd, .. }
+            | JournalEntry::FileDescriptorSetFdFlagsV1 { fd, .. }
             | JournalEntry::FileDescriptorSetFlagsV1 { fd, .. } => {
                 // If its stdio then we need to create the descriptor if its not there already
                 if *fd <= 3 && !state.stdio_descriptors.contains_key(fd) {
@@ -657,6 +661,11 @@ impl WritableJournal for CompactingJournalTx {
             JournalEntry::DuplicateFileDescriptorV1 {
                 original_fd,
                 copied_fd,
+            }
+            | JournalEntry::DuplicateFileDescriptorV2 {
+                original_fd,
+                copied_fd,
+                ..
             } => {
                 if let Some(lookup) = state.suspect_descriptors.get(original_fd).cloned() {
                     state.suspect_descriptors.insert(*copied_fd, lookup);
@@ -733,10 +742,10 @@ impl WritableJournal for CompactingJournalTx {
                 }
             }
             // Pipes that remain open at the end will be added
-            JournalEntry::CreatePipeV1 { fd1, fd2, .. } => {
+            JournalEntry::CreatePipeV1 { read_fd, write_fd } => {
                 let lookup = state.insert_new_sub_events(event_index);
-                state.open_pipes.insert(*fd1, lookup);
-                state.open_pipes.insert(*fd2, lookup);
+                state.open_pipes.insert(*read_fd, lookup);
+                state.open_pipes.insert(*write_fd, lookup);
             }
             // Epoll events
             JournalEntry::EpollCreateV1 { fd } => {
@@ -756,6 +765,11 @@ impl WritableJournal for CompactingJournalTx {
             JournalEntry::SocketAcceptedV1 { fd, .. } | JournalEntry::SocketOpenV1 { fd, .. } => {
                 let lookup = state.insert_new_sub_events(event_index);
                 state.open_sockets.insert(*fd, lookup);
+            }
+            JournalEntry::SocketPairV1 { fd1, fd2 } => {
+                let lookup = state.insert_new_sub_events(event_index);
+                state.open_sockets.insert(*fd1, lookup);
+                state.open_sockets.insert(*fd2, lookup);
             }
             JournalEntry::InitModuleV1 { .. } => {
                 state.clear_run_sub_events();

@@ -11,8 +11,8 @@ use futures::Future;
 use serde_derive::{Deserialize, Serialize};
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{watch, Mutex as AsyncMutex};
-use virtual_fs::{Pipe, VirtualFile};
-use wasmer_wasix_types::wasi::{EpollType, Fd as WasiFd, Fdflags, Filestat, Rights};
+use virtual_fs::{Pipe, PipeRx, PipeTx, VirtualFile};
+use wasmer_wasix_types::wasi::{EpollType, Fd as WasiFd, Fdflags, Fdflagsext, Filestat, Rights};
 
 use crate::{net::socket::InodeSocket, syscalls::EpollJoinWaker};
 
@@ -42,8 +42,9 @@ pub struct Fd {
 pub struct FdInner {
     pub rights: Rights,
     pub rights_inheriting: Rights,
-    pub flags: Fdflags,
-    pub offset: Arc<AtomicU64>,
+    pub flags: Fdflags,         // This is file table related flags, not fd flags
+    pub offset: Arc<AtomicU64>, // This also belongs in the file table
+    pub fd_flags: Fdflagsext,   // This is the actual FD flags that belongs here
 }
 
 impl Fd {
@@ -183,8 +184,15 @@ pub enum Kind {
         socket: InodeSocket,
     },
     #[cfg_attr(feature = "enable-serde", serde(skip))]
-    Pipe {
-        /// Reference to the pipe
+    PipeTx {
+        tx: PipeTx,
+    },
+    #[cfg_attr(feature = "enable-serde", serde(skip))]
+    PipeRx {
+        rx: PipeRx,
+    },
+    #[cfg_attr(feature = "enable-serde", serde(skip))]
+    DuplexPipe {
         pipe: Pipe,
     },
     Epoll {

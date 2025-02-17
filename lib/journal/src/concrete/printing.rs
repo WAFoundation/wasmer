@@ -121,7 +121,10 @@ impl<'a> fmt::Display for JournalEntry<'a> {
             JournalEntry::CloseFileDescriptorV1 { fd } => write!(f, "fd-close (fd={fd})"),
             JournalEntry::OpenFileDescriptorV1 {
                 fd, path, o_flags, ..
-            } => {
+            }
+            | JournalEntry::OpenFileDescriptorV2 {
+                fd, path, o_flags, ..
+            }=> {
                 if o_flags.contains(wasi::Oflags::CREATE) {
                     if o_flags.contains(wasi::Oflags::TRUNC) {
                         write!(f, "fd-create-new (fd={fd}, path={path})")
@@ -143,6 +146,11 @@ impl<'a> fmt::Display for JournalEntry<'a> {
                 original_fd,
                 copied_fd,
             } => write!(f, "fd-duplicate (original={original_fd}, copied={copied_fd})"),
+            JournalEntry::DuplicateFileDescriptorV2 {
+                original_fd,
+                copied_fd,
+                cloexec
+            } => write!(f, "fd-duplicate (original={original_fd}, copied={copied_fd}, cloexec={cloexec})"),
             JournalEntry::CreateDirectoryV1 { fd, path } => {
                 write!(f, "path-create-dir (fd={fd}, path={path})")
             }
@@ -161,6 +169,9 @@ impl<'a> fmt::Display for JournalEntry<'a> {
                 st_mtim,
                 ..
             } => write!(f, "fd-set-times (fd={fd}, atime={st_atim}, mtime={st_mtim})"),
+            JournalEntry::FileDescriptorSetFdFlagsV1 { fd, flags } => {
+                write!(f, "fd-set-fd-flags (fd={fd}, flags={flags:?})")
+            }
             JournalEntry::FileDescriptorSetFlagsV1 { fd, flags } => {
                 write!(f, "fd-set-flags (fd={fd}, flags={flags:?})")
             }
@@ -194,8 +205,8 @@ impl<'a> fmt::Display for JournalEntry<'a> {
                 write!(f, "epoll-ctl (epfd={epfd}, op={op:?}, fd={fd})")
             }
             JournalEntry::TtySetV1 { tty, line_feeds } => write!(f, "tty-set (echo={}, buffering={}, feeds={})", tty.echo, tty.line_buffered, line_feeds),
-            JournalEntry::CreatePipeV1 { fd1, fd2 } => {
-                write!(f, "fd-pipe (fd1={fd1}, fd2={fd2})")
+            JournalEntry::CreatePipeV1 { read_fd, write_fd } => {
+                write!(f, "fd-pipe (read_fd={read_fd}, write_fd={write_fd})")
             }
             JournalEntry::CreateEventV1 {
                 initial_val, fd, ..
@@ -222,6 +233,9 @@ impl<'a> fmt::Display for JournalEntry<'a> {
             JournalEntry::PortRouteDelV1 { ip } => write!(f, "port-route-del (ip={ip})"),
             JournalEntry::SocketOpenV1 { af, ty, pt, fd } => {
                 write!(f, "sock-open (fd={fd}, af={af:?}, ty={ty:?}, pt={pt:?})")
+            }
+            JournalEntry::SocketPairV1 { fd1, fd2 } => {
+                write!(f, "sock-pair (fd1={fd1}, fd2={fd2})")
             }
             JournalEntry::SocketListenV1 { fd, backlog } => {
                 write!(f, "sock-listen (fd={fd}, backlog={backlog})")

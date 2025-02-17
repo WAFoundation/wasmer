@@ -114,9 +114,15 @@ endif
 ENABLE_CRANELIFT ?=
 ENABLE_LLVM ?=
 ENABLE_SINGLEPASS ?=
+ENABLE_V8 ?=
+ENABLE_WAMR ?=
+ENABLE_WASMI ?=
 
 # Which compilers we build. These have dependencies that may not be on the system.
 compilers :=
+
+# Other backends to enable in the build phase (not while testing)
+build_compilers :=
 
 ##
 # Cranelift
@@ -145,7 +151,7 @@ endif
 ifeq ($(ENABLE_LLVM), 0)
 	LLVM_VERSION :=
 	# … then maybe the user forced to enable the LLVM compiler.
-else ifeq ($(ENABLE_LLVM), 1)
+else ifneq ($(filter 1 true,$(ENABLE_LLVM)),)
 	LLVM_VERSION := $(shell llvm-config --version)
 	compilers += llvm
 	# … or try to autodetect LLVM from `llvm-config-<version>`.
@@ -159,7 +165,7 @@ else ifneq (, $(shell which llvm-config 2>/dev/null))
 	ifneq (, $(findstring 18,$(LLVM_VERSION)))
 		compilers += llvm
 		export LLVM_SYS_180_PREFIX = $(shell llvm-config --prefix)
-	else ifneq (, $(findstring 14,$(LLVM_VERSION)))
+	else ifneq (, $(findstring 18,$(LLVM_VERSION)))
 		compilers += llvm
 		export LLVM_SYS_180_PREFIX = $(shell llvm-config --prefix)
 	endif
@@ -207,10 +213,63 @@ ifneq (, $(findstring singlepass,$(compilers)))
 endif
 
 ##
+# V8 
+##
+
+# If the user didn't disable the V8 backend…
+ifneq ($(ENABLE_V8), 0)
+	# … then maybe the user forced to enable the V8 compiler.
+	ifneq ($(filter 1 true,$(ENABLE_V8)),)
+		build_compilers += v8
+	endif
+	# we don't check automatically for now  
+endif
+
+ifneq (, $(findstring v8,$(build_compilers)))
+	ENABLE_V8 := 1
+endif
+
+##
+# WAMR 
+##
+
+# If the user didn't disable the WAMR backend…
+ifneq ($(ENABLE_WAMR), 0)
+	# … then maybe the user forced to enable the WAMR compiler.
+	ifneq ($(filter 1 true,$(ENABLE_WAMR)),)
+		build_compilers += wamr
+	# we don't check automatically for now  
+	endif
+endif
+
+ifneq (, $(findstring wamr,$(build_compilers)))
+	ENABLE_WAMR := 1
+endif
+
+##
+# wasmi 
+##
+
+# If the user didn't disable the wasmi backend…
+ifneq ($(ENABLE_WASMI), 0)
+	# … then maybe the user forced to enable the wasmi compiler.
+	ifneq ($(filter 1 true,$(ENABLE_WASMI)),)
+		build_compilers += wasmi
+	# we don't check automatically for now  
+	endif
+endif
+
+ifneq (, $(findstring wasmi,$(build_compilers)))
+	ENABLE_WASMI := 1
+endif
+
+
+##
 # Clean the `compilers` variable.
 ##
 
 compilers := $(strip $(compilers))
+build_compilers := $(strip $(build_compilers) $(compilers))
 
 
 #####
@@ -281,6 +340,7 @@ comma := ,
 
 # Define the compiler Cargo features for all crates.
 compiler_features := --features $(subst $(space),$(comma),$(compilers)),wasmer-artifact-create,static-artifact-create,wasmer-artifact-load,static-artifact-load
+build_compiler_features := --features $(subst $(space),$(comma),$(build_compilers)),wasmer-artifact-create,static-artifact-create,wasmer-artifact-load,static-artifact-load
 capi_compilers_engines_exclude :=
 
 # Define the compiler Cargo features for the C API. It always excludes
@@ -383,14 +443,14 @@ check-wasmer:
 	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/cli/Cargo.toml $(compiler_features) --bin wasmer --locked
 
 check-wasmer-wasm:
-	$(CARGO_BINARY) check --manifest-path lib/cli-compiler/Cargo.toml --target wasm32-wasi --features singlepass,cranelift --bin wasmer-compiler --locked
+	$(CARGO_BINARY) check --manifest-path lib/cli-compiler/Cargo.toml --target wasm32-wasip1 --features singlepass,cranelift --bin wasmer-compiler --locked
 
 check-capi:
 	RUSTFLAGS="${RUSTFLAGS}" $(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/c-api/Cargo.toml  \
 		--no-default-features --features wat,compiler,wasi,middlewares $(capi_compiler_features)
 
 build-wasmer:
-	$(CARGO_BINARY) build $(CARGO_TARGET_FLAG) --release --manifest-path lib/cli/Cargo.toml $(compiler_features) --bin wasmer --locked
+	$(CARGO_BINARY) build $(CARGO_TARGET_FLAG) --release --manifest-path lib/cli/Cargo.toml $(build_compiler_features) --bin wasmer --locked
 	
 build-wasmer-v8:
 	$(CARGO_BINARY) build $(CARGO_TARGET_FLAG) --release --manifest-path lib/cli/Cargo.toml --no-default-features --features="v8" --bin wasmer --locked
@@ -414,7 +474,7 @@ bench:
 	$(CARGO_BINARY) bench $(CARGO_TARGET_FLAG) $(compiler_features)
 
 build-wasmer-wasm:
-	$(CARGO_BINARY) build --release --manifest-path lib/cli-compiler/Cargo.toml --target wasm32-wasi --features singlepass,cranelift --bin wasmer-compiler --locked
+	$(CARGO_BINARY) build --release --manifest-path lib/cli-compiler/Cargo.toml --target wasm32-wasip1 --features singlepass,cranelift --bin wasmer-compiler --locked
 
 # For best results ensure the release profile looks like the following
 # in Cargo.toml:
@@ -552,12 +612,12 @@ build-capi-headless-ios:
 
 # test compilers
 test-stage-0-wast:
-	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --release $(compiler_features) --locked
+	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --release $(compiler_features) --locked --jobs=1
 
 # test packages
 test-stage-1-test-all:
-	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --workspace --release $(exclude_tests) --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner $(compiler_features) --locked
-	$(CARGO_BINARY) test --doc $(CARGO_TARGET_FLAG) --workspace --release $(exclude_tests) --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner $(compiler_features) --locked
+	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --workspace --release $(exclude_tests) --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner $(compiler_features) --locked --jobs=1
+	$(CARGO_BINARY) test --doc $(CARGO_TARGET_FLAG) --workspace --release $(exclude_tests) --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner $(compiler_features) --locked --jobs=1
 test-stage-2-test-compiler-cranelift-nostd:
 	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --manifest-path lib/compiler-cranelift/Cargo.toml --release --no-default-features --features=std --locked
 test-stage-3-test-compiler-singlepass-nostd:
@@ -588,17 +648,17 @@ test-examples: test-stage-5-test-examples test-stage-6-test-examples-release
 test-v8: test-v8-api
 
 test-v8-api:
-	CARGO_TERM_VERBOSE=true cargo nextest run --package=wasmer --release --features=v8 --no-default-features
+	cargo nextest run --package=wasmer --release --features="v8-default" --no-default-features
 
 test-wamr: test-wamr-api
 
 test-wamr-api:
-	cargo nextest run --package=wasmer --release --features=wamr --no-default-features
+	cargo nextest run --package=wasmer --release --features="wamr-default" --no-default-features
 
 test-wasmi: test-wasmi-api
 
 test-wasmi-api:
-	cargo nextest run --package=wasmer --release --features=wasmi --no-default-features
+	cargo nextest run --package=wasmer --release --features="wasmi-default" --no-default-features
 
 test-js: test-js-api test-js-wasi
 
@@ -672,20 +732,20 @@ test-wasix: build-wasmer
 
 test-integration-cli: build-wasmer build-capi package-capi-headless package distribution
 	cp ./dist/wasmer.tar.gz ./link.tar.gz
-	rustup target add wasm32-wasi
+	rustup target add wasm32-wasip1
 	WASMER_DIR=`pwd`/package $(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --features webc_runner --no-fail-fast -p wasmer-integration-tests-cli --locked
 
 # Before running this in the CI, we need to set up link.tar.gz and /cache/wasmer-[target].tar.gz
 test-integration-cli-ci: require-nextest
-	rustup target add wasm32-wasi
+	rustup target add wasm32-wasip1
 	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --features webc_runner -p wasmer-integration-tests-cli --locked
 
 test-integration-cli-wamr-ci: require-nextest build-wasmer-wamr
-	rustup target add wasm32-wasi
+	rustup target add wasm32-wasip1
 	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --features webc_runner,wamr -p wasmer-integration-tests-cli --locked --no-fail-fast -E "not (test(deploy) | test(snapshot) | test(login) | test(init) | test(gen_c_header) | test(up_to_date) | test(publish) | test(create) | test(whoami) | test(config) | test(c_flags))"
 
 test-integration-cli-wasmi-ci: require-nextest build-wasmer-wasmi
-	rustup target add wasm32-wasi
+	rustup target add wasm32-wasip1
 	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --features webc_runner,wamr -p wasmer-integration-tests-cli --locked --no-fail-fast -E "not (test(deploy) | test(snapshot) | test(login) | test(init) | test(gen_c_header) | test(up_to_date) | test(publish) | test(create) | test(whoami) | test(config) | test(c_flags))"
 
 

@@ -275,8 +275,7 @@ impl Console {
 
         // Build the config
         // Run the binary
-        let store = self.runtime.new_store();
-        let process = InlineWaker::block_on(spawn_exec(pkg, prog, store, env, &self.runtime))?;
+        let process = InlineWaker::block_on(spawn_exec(pkg, prog, env, &self.runtime))?;
 
         // Return the process
         Ok((process, wasi_process))
@@ -361,7 +360,6 @@ mod tests {
                 )
                 .await?;
 
-                stdin_tx.close();
                 std::mem::drop(stdin_tx);
 
                 let res = handle.wait_finished().await?;

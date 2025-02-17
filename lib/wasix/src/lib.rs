@@ -27,7 +27,7 @@ compile_error!("The `sys` feature must be enabled only for non-`wasm32` target."
 
 #[cfg(all(feature = "js", not(target_arch = "wasm32")))]
 compile_error!(
-    "The `js` feature must be enabled only for the `wasm32` target (either `wasm32-unknown-unknown` or `wasm32-wasi`)."
+    "The `js` feature must be enabled only for the `wasm32` target (either `wasm32-unknown-unknown` or `wasm32-wasip1`)."
 );
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -524,6 +524,9 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "fd_readdir" => Function::new_typed_with_env(&mut store, env, fd_readdir::<Memory32>),
         "fd_renumber" => Function::new_typed_with_env(&mut store, env, fd_renumber),
         "fd_dup" => Function::new_typed_with_env(&mut store, env, fd_dup::<Memory32>),
+        "fd_dup2" => Function::new_typed_with_env(&mut store, env, fd_dup2::<Memory32>),
+        "fd_fdflags_get" => Function::new_typed_with_env(&mut store, env, fd_fdflags_get::<Memory32>),
+        "fd_fdflags_set" => Function::new_typed_with_env(&mut store, env, fd_fdflags_set),
         "fd_event" => Function::new_typed_with_env(&mut store, env, fd_event::<Memory32>),
         "fd_seek" => Function::new_typed_with_env(&mut store, env, fd_seek::<Memory32>),
         "fd_sync" => Function::new_typed_with_env(&mut store, env, fd_sync),
@@ -535,6 +538,7 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "path_filestat_set_times" => Function::new_typed_with_env(&mut store, env, path_filestat_set_times::<Memory32>),
         "path_link" => Function::new_typed_with_env(&mut store, env, path_link::<Memory32>),
         "path_open" => Function::new_typed_with_env(&mut store, env, path_open::<Memory32>),
+        "path_open2" => Function::new_typed_with_env(&mut store, env, path_open2::<Memory32>),
         "path_readlink" => Function::new_typed_with_env(&mut store, env, path_readlink::<Memory32>),
         "path_remove_directory" => Function::new_typed_with_env(&mut store, env, path_remove_directory::<Memory32>),
         "path_rename" => Function::new_typed_with_env(&mut store, env, path_rename::<Memory32>),
@@ -590,6 +594,7 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "sock_addr_local" => Function::new_typed_with_env(&mut store, env, sock_addr_local::<Memory32>),
         "sock_addr_peer" => Function::new_typed_with_env(&mut store, env, sock_addr_peer::<Memory32>),
         "sock_open" => Function::new_typed_with_env(&mut store, env, sock_open::<Memory32>),
+        "sock_pair" => Function::new_typed_with_env(&mut store, env, sock_pair::<Memory32>),
         "sock_set_opt_flag" => Function::new_typed_with_env(&mut store, env, sock_set_opt_flag),
         "sock_get_opt_flag" => Function::new_typed_with_env(&mut store, env, sock_get_opt_flag::<Memory32>),
         "sock_set_opt_time" => Function::new_typed_with_env(&mut store, env, sock_set_opt_time::<Memory32>),
@@ -647,6 +652,9 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "fd_readdir" => Function::new_typed_with_env(&mut store, env, fd_readdir::<Memory64>),
         "fd_renumber" => Function::new_typed_with_env(&mut store, env, fd_renumber),
         "fd_dup" => Function::new_typed_with_env(&mut store, env, fd_dup::<Memory64>),
+        "fd_dup2" => Function::new_typed_with_env(&mut store, env, fd_dup2::<Memory64>),
+        "fd_fdflags_get" => Function::new_typed_with_env(&mut store, env, fd_fdflags_get::<Memory64>),
+        "fd_fdflags_set" => Function::new_typed_with_env(&mut store, env, fd_fdflags_set),
         "fd_event" => Function::new_typed_with_env(&mut store, env, fd_event::<Memory64>),
         "fd_seek" => Function::new_typed_with_env(&mut store, env, fd_seek::<Memory64>),
         "fd_sync" => Function::new_typed_with_env(&mut store, env, fd_sync),
@@ -658,6 +666,7 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "path_filestat_set_times" => Function::new_typed_with_env(&mut store, env, path_filestat_set_times::<Memory64>),
         "path_link" => Function::new_typed_with_env(&mut store, env, path_link::<Memory64>),
         "path_open" => Function::new_typed_with_env(&mut store, env, path_open::<Memory64>),
+        "path_open2" => Function::new_typed_with_env(&mut store, env, path_open2::<Memory64>),
         "path_readlink" => Function::new_typed_with_env(&mut store, env, path_readlink::<Memory64>),
         "path_remove_directory" => Function::new_typed_with_env(&mut store, env, path_remove_directory::<Memory64>),
         "path_rename" => Function::new_typed_with_env(&mut store, env, path_rename::<Memory64>),
@@ -713,6 +722,7 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "sock_addr_local" => Function::new_typed_with_env(&mut store, env, sock_addr_local::<Memory64>),
         "sock_addr_peer" => Function::new_typed_with_env(&mut store, env, sock_addr_peer::<Memory64>),
         "sock_open" => Function::new_typed_with_env(&mut store, env, sock_open::<Memory64>),
+        "sock_pair" => Function::new_typed_with_env(&mut store, env, sock_pair::<Memory64>),
         "sock_set_opt_flag" => Function::new_typed_with_env(&mut store, env, sock_set_opt_flag),
         "sock_get_opt_flag" => Function::new_typed_with_env(&mut store, env, sock_get_opt_flag::<Memory64>),
         "sock_set_opt_time" => Function::new_typed_with_env(&mut store, env, sock_set_opt_time::<Memory64>),
