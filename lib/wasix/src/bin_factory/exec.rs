@@ -15,7 +15,8 @@ use crate::{
     RewindState, SpawnError, WasiError, WasiRuntimeError,
 };
 use tracing::*;
-use wasmer::{Function, Memory32, Memory64, Module, Store};
+use virtual_mio::InlineWaker;
+use wasmer::{Function, Memory32, Memory64, Module, RuntimeError, Store, Value};
 use wasmer_wasix_types::wasi::Errno;
 
 use super::BinaryPackage;
@@ -30,9 +31,9 @@ pub async fn spawn_exec(
 ) -> Result<TaskJoinHandle, SpawnError> {
     spawn_union_fs(&env, &binary).await?;
 
-    let wasm = spawn_load_wasm(&env, &binary, name).await?;
+    let wasm = spawn_load_wasm(&binary, name).await?;
 
-    let module = spawn_load_module(&env, name, wasm, runtime).await?;
+    let module = spawn_load_module(name, wasm, runtime).await?;
 
     // Free the space used by the binary, since we don't need it
     // any longer
@@ -48,13 +49,12 @@ pub async fn spawn_exec_wasm(
     env: WasiEnv,
     runtime: &Arc<dyn Runtime + Send + Sync + 'static>,
 ) -> Result<TaskJoinHandle, SpawnError> {
-    let module = spawn_load_module(&env, name, wasm, runtime).await?;
+    let module = spawn_load_module(name, wasm, runtime).await?;
 
     spawn_exec_module(module, env, runtime)
 }
 
 pub async fn spawn_load_wasm<'a>(
-    env: &WasiEnv,
     binary: &'a BinaryPackage,
     name: &str,
 ) -> Result<&'a [u8], SpawnError> {
@@ -68,7 +68,6 @@ pub async fn spawn_load_wasm<'a>(
           pkg=%binary.id,
           "Unable to spawn a command because its package has no entrypoint",
         );
-        env.on_exit(Some(Errno::Noexec.into())).await;
         return Err(SpawnError::MissingEntrypoint {
             package_id: binary.id.clone(),
         });
@@ -77,7 +76,6 @@ pub async fn spawn_load_wasm<'a>(
 }
 
 pub async fn spawn_load_module(
-    env: &WasiEnv,
     name: &str,
     wasm: &[u8],
     runtime: &Arc<dyn Runtime + Send + Sync + 'static>,
@@ -90,7 +88,6 @@ pub async fn spawn_load_module(
                 error = &err as &dyn std::error::Error,
                 "Failed to compile the module",
             );
-            env.on_exit(Some(Errno::Noexec.into())).await;
             Err(err)
         }
     }
@@ -130,7 +127,15 @@ pub fn spawn_exec_module(
         let tasks_outer = tasks.clone();
 
         tasks_outer
-            .task_wasm(TaskWasm::new(Box::new(run_exec), env, module, true))
+            .task_wasm(
+                TaskWasm::new(Box::new(run_exec), env, module, true).with_pre_run(Box::new(
+                    |ctx, store| {
+                        Box::pin(async move {
+                            ctx.data(store).state.fs.close_cloexec_fds().await;
+                        })
+                    },
+                )),
+            )
             .map_err(|err| {
                 error!("wasi[{}]::failed to launch module - {}", pid, err);
                 SpawnError::UnknownError
@@ -271,15 +276,32 @@ fn call_module(
     // Invoke the start function
     let ret = {
         // Call the module
-        let call_ret = if let Some(start) = get_start(&ctx, &store) {
-            start.call(&mut store, &[])
-        } else {
+        let Some(start) = get_start(&ctx, &store) else {
             debug!("wasi[{}]::exec-failed: missing _start function", pid);
             ctx.data(&store)
                 .blocking_on_exit(Some(Errno::Noexec.into()));
             unsafe { run_recycle(recycle, ctx, store) };
             return;
         };
+
+        let mut call_ret = start.call(&mut store, &[]);
+
+        loop {
+            // Technically, it's an error for a vfork to return from main, but anyway...
+            match resume_vfork(&ctx, &mut store, &start, &call_ret) {
+                // A vfork was resumed, there may be another, so loop back
+                Ok(Some(ret)) => call_ret = ret,
+
+                // An error was encountered when restoring from the vfork, report it
+                Err(e) => {
+                    call_ret = Err(RuntimeError::user(Box::new(WasiError::Exit(e.into()))));
+                    break;
+                }
+
+                // No vfork, keep the call_ret value
+                Ok(None) => break,
+            }
+        }
 
         if let Err(err) = call_ret {
             match err.downcast::<WasiError>() {
@@ -347,4 +369,98 @@ fn call_module(
 
     debug!("wasi[{pid}]::main() has exited with {code}");
     handle.thread.set_status_finished(ret.map(|a| a.into()));
+}
+
+#[allow(clippy::type_complexity)]
+fn resume_vfork(
+    ctx: &WasiFunctionEnv,
+    store: &mut Store,
+    start: &Function,
+    call_ret: &Result<Box<[Value]>, RuntimeError>,
+) -> Result<Option<Result<Box<[Value]>, RuntimeError>>, Errno> {
+    let (err, code) = match call_ret {
+        Ok(_) => (None, wasmer_wasix_types::wasi::ExitCode::from(0u16)),
+        Err(err) => match err.downcast_ref::<WasiError>() {
+            // If the child process is just deep sleeping, we don't restore the vfork
+            Some(WasiError::DeepSleep(..)) => return Ok(None),
+
+            Some(WasiError::Exit(code)) => (None, *code),
+            Some(WasiError::ThreadExit) => (None, wasmer_wasix_types::wasi::ExitCode::from(0u16)),
+            Some(WasiError::UnknownWasiVersion) => (None, Errno::Noexec.into()),
+            None => (
+                Some(WasiRuntimeError::from(err.clone())),
+                Errno::Unknown.into(),
+            ),
+        },
+    };
+
+    if let Some(mut vfork) = ctx.data_mut(store).vfork.take() {
+        if let Some(err) = err {
+            error!(%err, "Error from child process");
+            eprintln!("{err}");
+        }
+
+        InlineWaker::block_on(
+            unsafe { ctx.data(store).get_memory_and_wasi_state(store, 0) }
+                .1
+                .fs
+                .close_all(),
+        );
+
+        tracing::debug!(
+            pid = %ctx.data_mut(store).process.pid(),
+            vfork_pid = %vfork.env.process.pid(),
+            "Resuming from vfork after child process was terminated"
+        );
+
+        // Restore the WasiEnv to the point when we vforked
+        vfork.env.swap_inner(ctx.data_mut(store));
+        std::mem::swap(vfork.env.as_mut(), ctx.data_mut(store));
+        let mut child_env = *vfork.env;
+        child_env.owned_handles.push(vfork.handle);
+
+        // Terminate the child process
+        child_env.process.terminate(code);
+
+        // Jump back to the vfork point and current on execution
+        let child_pid = child_env.process.pid();
+        let rewind_stack = vfork.rewind_stack.freeze();
+        let store_data = vfork.store_data;
+
+        let ctx = ctx.env.clone().into_mut(store);
+        // Now rewind the previous stack and carry on from where we did the vfork
+        let rewind_result = if vfork.is_64bit {
+            crate::syscalls::rewind::<Memory64, _>(
+                ctx,
+                None,
+                rewind_stack,
+                store_data,
+                crate::syscalls::ForkResult {
+                    pid: child_pid.raw() as wasmer_wasix_types::wasi::Pid,
+                    ret: Errno::Success,
+                },
+            )
+        } else {
+            crate::syscalls::rewind::<Memory32, _>(
+                ctx,
+                None,
+                rewind_stack,
+                store_data,
+                crate::syscalls::ForkResult {
+                    pid: child_pid.raw() as wasmer_wasix_types::wasi::Pid,
+                    ret: Errno::Success,
+                },
+            )
+        };
+
+        match rewind_result {
+            Errno::Success => Ok(Some(start.call(store, &[]))),
+            err => {
+                warn!("fork failed - could not rewind the stack - errno={}", err);
+                Err(err)
+            }
+        }
+    } else {
+        Ok(None)
+    }
 }
