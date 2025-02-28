@@ -74,11 +74,19 @@ middlewares = ["compiler", "wasmer-middlewares"]
 sys = []
 
 # Enable the `singlepass` compiler.
-singlepass = ["wasmer-compiler-singlepass", "compiler"]
+singlepass = [
+	"dep:wasmer-compiler-singlepass",
+	"wasmer-api/singlepass",
+	"compiler",
+]
 # Enable the `cranelift` compiler. 
-cranelift = ["wasmer-compiler-cranelift", "compiler"]
+cranelift = [
+	"dep:wasmer-compiler-cranelift",
+	"wasmer-api/cranelift",
+	"compiler",
+]
 # Enable the `llvm` compiler.
-llvm = ["wasmer-compiler-llvm", "compiler"]
+llvm = ["dep:wasmer-compiler-llvm", "wasmer-api/llvm", "compiler"]
 
 # Enable the use of compiler. Implies enabling the `sys` feature.
 compiler = [
