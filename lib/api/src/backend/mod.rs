@@ -48,7 +48,6 @@ pub enum BackendKind {
     Jsc,
 }
 
-///
 impl Default for BackendKind {
     fn default() -> Self {
         #[cfg(feature = "sys-default")]
